@@ -1,0 +1,14 @@
+.DS_Store
+*.swp
+*.swo
+
+# Local build artifacts
+build/
+smb_wiiu/build/
+smb_wiiu/smb_wiiu_cemu/
+
+# Large binaries
+Super Mario Bros. (Japan, USA).nes
+wiiu_platformer.elf
+wiiu_platformer.rpx
+wiiu_platformer.wuhb
