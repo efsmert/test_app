@@ -23,8 +23,10 @@ struct LevelSectionRuntime {
   LevelTheme theme;
   int flagX;
   bool hasFlag;
+  const uint8_t (*atlasT)[MAP_W];
   const uint8_t (*atlasX)[MAP_W];
   const uint8_t (*atlasY)[MAP_W];
+  const uint8_t (*collide)[MAP_W];
   const uint8_t (*qmeta)[MAP_W];
   const PipeLink *pipes;
   int pipeCount;
@@ -37,12 +39,17 @@ struct LevelSectionRuntime {
   int startY;
   int mapWidth;
   int mapHeight;
+  int bgPrimary;
+  int bgSecondary;
+  bool bgClouds;
 };
 
 struct LevelSectionData {
   const uint8_t (*map)[MAP_W];
+  const uint8_t (*atlasT)[MAP_W];
   const uint8_t (*atlasX)[MAP_W];
   const uint8_t (*atlasY)[MAP_W];
+  const uint8_t (*collide)[MAP_W];
   const uint8_t (*qmeta)[MAP_W];
   int mapWidth;
   int mapHeight;
@@ -51,6 +58,9 @@ struct LevelSectionData {
   bool hasFlag;
   int startX;
   int startY;
+  int bgPrimary;
+  int bgSecondary;
+  bool bgClouds;
   const PipeLink *pipes;
   int pipeCount;
   const EnemySpawn *enemies;

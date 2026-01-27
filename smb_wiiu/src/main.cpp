@@ -5,6 +5,8 @@
 #include "game_types.h"
 #include "levels.h"
 #include <cmath>
+#include <vector>
+#include <utility>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,12 +25,27 @@ constexpr int GAME_H = 240, TV_W = 1280, TV_H = 720;
 constexpr int GAME_W = (GAME_H * TV_W + TV_H / 2) / TV_H;
 constexpr int PLAYER_DRAW_W_SMALL = 16;
 constexpr int PLAYER_DRAW_W_BIG = 16;
+
+// Gameplay collision boxes are intentionally slightly smaller than the visuals
+// to make tight gaps and pipe entry feel less "pixel perfect".
+constexpr float PLAYER_HIT_W_SMALL = 14.0f;
+constexpr float PLAYER_HIT_H_SMALL = 15.0f; // 1-tile gaps (16px) are enterable
+constexpr float PLAYER_HIT_W_BIG = 15.0f;
+constexpr float PLAYER_HIT_H_BIG = 31.0f;   // 2-tile gaps (32px) are enterable
 enum GameState { GS_TITLE, GS_PLAYING, GS_FLAG, GS_DEAD, GS_GAMEOVER, GS_WIN, GS_PAUSE };
 constexpr uint8_t QMETA_COIN = 0;
 constexpr uint8_t QMETA_POWERUP = 1;
 constexpr uint8_t QMETA_ONEUP = 2;
 constexpr uint8_t QMETA_STAR = 3;
-enum TitleMode { TITLE_CHAR_SELECT = 0, TITLE_OPTIONS = 1 };
+enum TitleMode { TITLE_MAIN = 0, TITLE_CHAR_SELECT = 1, TITLE_OPTIONS = 2, TITLE_EXTRAS = 3 };
+constexpr uint8_t COL_NONE = 0;
+constexpr uint8_t COL_SOLID = 1;
+constexpr uint8_t COL_ONEWAY = 2;
+constexpr uint8_t ATLAS_NONE = 0;
+constexpr uint8_t ATLAS_TERRAIN = 1;
+constexpr uint8_t ATLAS_DECO = 2;
+constexpr uint8_t ATLAS_LIQUID = 3;
+constexpr int SFX_CH_BREAK = 0; // legacy (was reserved for brick breaks)
 
 struct Rect {
   float x, y, w, h;
@@ -49,6 +66,7 @@ struct Player {
   Power power;
   int lives, coins, score;
   float invT, animT;
+  float throwT;
   bool dead;
 };
 
@@ -76,26 +94,37 @@ static SDL_Texture *g_texLifeIcon[4] = {nullptr, nullptr, nullptr, nullptr};
 static SDL_Texture *g_texTitle = nullptr;
 static SDL_Texture *g_texCursor = nullptr;
 static SDL_Texture *g_texMenuBG = nullptr;
+static SDL_Texture *g_texCoinIcon = nullptr;
 static SDL_Texture *g_texGoomba = nullptr;
 static SDL_Texture *g_texKoopa = nullptr;
 static SDL_Texture *g_texKoopaSheet = nullptr;
 static SDL_Texture *g_texQuestion = nullptr;
 static SDL_Texture *g_texMushroom = nullptr;
 static SDL_Texture *g_texFireFlower = nullptr;
-static SDL_Texture *g_texFireball = nullptr;
-static SDL_Texture *g_texCoin = nullptr;
-static SDL_Texture *g_texTerrain = nullptr;
+	static SDL_Texture *g_texFireball = nullptr;
+	static SDL_Texture *g_texCoin = nullptr;
+	static SDL_Texture *g_texTerrain = nullptr;
+	static SDL_Texture *g_texDeco = nullptr;
+static SDL_Texture *g_texLiquids = nullptr;
+static SDL_Texture *g_texBgHills = nullptr;
+static SDL_Texture *g_texBgBushes = nullptr;
+static SDL_Texture *g_texBgCloudOverlay = nullptr;
+static SDL_Texture *g_texBgSky = nullptr;
+static SDL_Texture *g_texBgSecondary = nullptr; // Trees/Mushrooms layer
 static SDL_Texture *g_texFlagPole = nullptr;
 static SDL_Texture *g_texFlag = nullptr;
 static SDL_Texture *g_texCastle = nullptr;
+static SDL_Rect g_castleDrawDst = {0, 0, 0, 0};
+static bool g_castleDrawOn = false;
 static LevelTheme g_theme = THEME_OVERWORLD;
 static const char *g_charNames[] = {"Luigi", "Toad", "Toadette"};
 static const char *g_charDisplayNames[] = {"LUIGI", "TOAD", "TOADETTE"};
 static const int g_charCount = 3;
 static int g_charIndex = 0;
 static int g_menuIndex = 0;
-static int g_titleMode = TITLE_CHAR_SELECT;
+static int g_titleMode = TITLE_MAIN;
 static int g_optionsIndex = 0;
+static int g_mainMenuIndex = 0;
 static int g_pauseIndex = 0;
 static const char *g_pauseOptions[] = {"RESUME", "NEXT LEVEL", "PREVIOUS LEVEL",
                                        "CYCLE THEME", "MAIN MENU"};
@@ -131,6 +160,60 @@ static Mix_Music *g_bgmUnderground = nullptr;
 static Mix_Music *g_bgmCastle = nullptr;
 static Mix_Music *g_bgmByTheme[(int)THEME_COUNT] = {};
 static float g_skidCooldown = 0.0f;
+
+struct ForegroundDeco {
+  int tx;
+  int ty;
+  uint8_t w;
+  uint8_t h;
+  uint8_t cellCount;
+  struct Cell {
+    int8_t dx;
+    int8_t dy;
+    uint8_t ax;
+    uint8_t ay;
+  } cells[16];
+};
+static ForegroundDeco g_fgDecos[192];
+static int g_fgDecoCount = 0;
+
+struct TileBump {
+  int tx;
+  int ty;
+  float t;
+};
+static TileBump g_tileBumps[64];
+
+static void addTileBump(int tx, int ty) {
+  for (auto &b : g_tileBumps) {
+    if (b.t > 0.0f && b.tx == tx && b.ty == ty) {
+      b.t = 0.12f;
+      return;
+    }
+  }
+  for (auto &b : g_tileBumps) {
+    if (b.t <= 0.0f) {
+      b.tx = tx;
+      b.ty = ty;
+      b.t = 0.12f;
+      return;
+    }
+  }
+}
+
+static bool bumpTransformForTile(int tx, int ty, float &outLiftPx,
+                                 float &outScale) {
+  for (auto &b : g_tileBumps) {
+    if (b.t > 0.0f && b.tx == tx && b.ty == ty) {
+      float p = 1.0f - (b.t / 0.12f); // 0..1
+      float tri = (p < 0.5f) ? (p * 2.0f) : (2.0f - p * 2.0f);
+      outLiftPx = tri * 2.0f;
+      outScale = 1.0f + tri * 0.06f;
+      return true;
+    }
+  }
+  return false;
+}
 
 // Simple 5x7 font (bits are 0..4 in each row)
 static const uint8_t kFont5x7[][7] = {
@@ -204,6 +287,11 @@ void drawText(int x, int y, const char *text, int scale, SDL_Color color) {
   }
 }
 
+void drawTextShadow(int x, int y, const char *text, int scale, SDL_Color color) {
+  drawText(x + 1, y + 1, text, scale, {0, 0, 0, 255});
+  drawText(x, y, text, scale, color);
+}
+
 int textWidth(const char *text, int scale) {
   int len = 0;
   for (const char *p = text; *p; ++p)
@@ -218,15 +306,72 @@ bool overlap(const Rect &a, const Rect &b) {
 
 int mapWidth() { return g_levelInfo.mapWidth > 0 ? g_levelInfo.mapWidth : MAP_W; }
 
+bool solidAt(int tx, int ty);
+uint8_t collisionAt(int tx, int ty);
+
+float standHeightForPower(Power p) {
+  return (p >= P_BIG) ? PLAYER_HIT_H_BIG : PLAYER_HIT_H_SMALL;
+}
+
+void setPlayerSizePreserveFeet(float newW, float newH) {
+  float footY = g_p.r.y + g_p.r.h;
+  g_p.r.w = newW;
+  g_p.r.h = newH;
+  g_p.r.y = footY - newH;
+}
+
+bool rectBlockedBySolids(const Rect &r) {
+  int tx1 = (int)(r.x / TILE);
+  int tx2 = (int)((r.x + r.w - 1) / TILE);
+  int ty1 = (int)(r.y / TILE);
+  int ty2 = (int)((r.y + r.h - 1) / TILE);
+  for (int ty = ty1; ty <= ty2; ty++) {
+    for (int tx = tx1; tx <= tx2; tx++) {
+      if (solidAt(tx, ty))
+        return true;
+    }
+  }
+  return false;
+}
+
 bool solidAt(int tx, int ty) {
+  return collisionAt(tx, ty) == COL_SOLID;
+}
+
+uint8_t collisionAt(int tx, int ty) {
   if (tx < 0 || tx >= mapWidth() || ty < 0 || ty >= MAP_H)
-    return false;
-  if (g_map[ty][tx] >= T_GROUND && g_map[ty][tx] != T_FLAG)
-    return true;
+    return COL_NONE;
+  switch ((Tile)g_map[ty][tx]) {
+  case T_GROUND:
+  case T_BRICK:
+  case T_QUESTION:
+  case T_USED:
+  case T_PIPE:
+  case T_CASTLE:
+    return COL_SOLID;
+  case T_EMPTY:
+  case T_FLAG:
+  case T_COIN:
+    return COL_NONE;
+  default:
+    break;
+  }
+  if (g_levelInfo.collide) {
+    uint8_t col = g_levelInfo.collide[ty][tx];
+    // Heuristic: treat floating "top surface" terrain tiles as one-way so
+    // mushroom platforms and grassy ledges can be jumped through from below,
+    // while ground-backed tiles remain fully solid.
+    if (col == COL_SOLID && g_levelInfo.atlasX && g_levelInfo.atlasY &&
+        g_levelInfo.atlasX[ty][tx] != 255 && g_levelInfo.atlasY[ty][tx] == 0 &&
+        ty + 1 < MAP_H && g_levelInfo.collide[ty + 1][tx] == COL_NONE) {
+      return COL_ONEWAY;
+    }
+    return col;
+  }
   if (g_levelInfo.atlasX && g_levelInfo.atlasY &&
       g_levelInfo.atlasX[ty][tx] != 255 && g_levelInfo.atlasY[ty][tx] != 255)
-    return true;
-  return false;
+    return COL_SOLID;
+  return COL_NONE;
 }
 
 uint8_t questionMetaAt(int tx, int ty) {
@@ -280,24 +425,9 @@ int fireFlowerRowForTheme(LevelTheme t) {
 }
 
 SDL_Rect firePlayerSrcForFrame(int frame) {
-  switch (frame) {
-  case 0: // idle
-    return {0, 0, 32, 48};
-  case 1: // crouch
-    return {32, 0, 32, 48};
-  case 2: // walk 1
-    return {64, 0, 32, 48};
-  case 3: // walk 2
-    return {96, 0, 32, 48};
-  case 4: // walk 3 / skid fallback
-    return {128, 0, 32, 48};
-  case 5: // skid
-    return {160, 0, 32, 48};
-  case 6: // jump
-    return {192, 0, 32, 48};
-  default:
-    return {0, 0, 32, 48};
-  }
+  // Fire sheets are exported as 16x32 frames (matching the Big sheet layout),
+  // with extra attack frames appended.
+  return {frame * 16, 0, 16, 32};
 }
 
 bool playerStomp(const Rect &enemy) {
@@ -324,12 +454,16 @@ SDL_Texture *loadTex(const char *file) {
   // Prefer PNG alpha when present; fall back to bright-green chroma key for
   // legacy placeholder sheets.
   if (s->format->Amask == 0 ||
+      (strstr(file, "tilesets/Deco/") != nullptr) ||
+      (strstr(file, "sprites/tilesets/Deco/") != nullptr) ||
       (strstr(file, "sprites/ui/TitleSMB1.png") != nullptr) ||
+      (strstr(file, "sprites/ui/CoinIcon.png") != nullptr) ||
       (strstr(file, "FlagPole.png") != nullptr) ||
       (strstr(file, "KoopaTroopaSheet.png") != nullptr) ||
       (strstr(file, "QuestionBlock.png") != nullptr) ||
       (strstr(file, "FireFlower.png") != nullptr) ||
-      (strstr(file, "Fireball.png") != nullptr)) {
+      (strstr(file, "Fireball.png") != nullptr) ||
+      (strstr(file, "SpinningCoin.png") != nullptr)) {
     Uint32 colorKey = SDL_MapRGB(s->format, 0, 255, 0);
     SDL_SetColorKey(s, SDL_TRUE, colorKey);
   }
@@ -337,12 +471,68 @@ SDL_Texture *loadTex(const char *file) {
   g_loadedTex++;
   SDL_Texture *t = SDL_CreateTextureFromSurface(g_ren, s);
   SDL_FreeSurface(s);
+  if (t) {
+    // Ensure alpha blending is enabled consistently (helps with some assets
+    // that rely on partial transparency).
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+  }
   return t;
 }
 
 void setSfxVolume(Mix_Chunk *sfx) {
   if (sfx)
     Mix_VolumeChunk(sfx, MIX_MAX_VOLUME);
+}
+
+SDL_Texture *loadTexScaled(const char *file, int outW, int outH) {
+  SDL_Surface *s = nullptr;
+  if (file[0] == '/' ||
+      strstr(file, "Super-Mario-Bros.-Remastered-Public") != nullptr) {
+    s = IMG_Load(file);
+  } else {
+    char path[512];
+    const char *paths[] = {"content/%s", "../content/%s", "fs:/vol/content/%s"};
+    for (int i = 0; i < 3 && !s; i++) {
+      snprintf(path, sizeof(path), paths[i], file);
+      s = IMG_Load(path);
+    }
+  }
+  if (!s)
+    return nullptr;
+
+  // Apply the same chroma-key rules as loadTex().
+  if (s->format->Amask == 0 ||
+      (strstr(file, "tilesets/Deco/") != nullptr) ||
+      (strstr(file, "sprites/tilesets/Deco/") != nullptr) ||
+      (strstr(file, "sprites/ui/TitleSMB1.png") != nullptr) ||
+      (strstr(file, "sprites/ui/CoinIcon.png") != nullptr) ||
+      (strstr(file, "FlagPole.png") != nullptr) ||
+      (strstr(file, "KoopaTroopaSheet.png") != nullptr) ||
+      (strstr(file, "QuestionBlock.png") != nullptr) ||
+      (strstr(file, "FireFlower.png") != nullptr) ||
+      (strstr(file, "Fireball.png") != nullptr) ||
+      (strstr(file, "SpinningCoin.png") != nullptr)) {
+    Uint32 colorKey = SDL_MapRGB(s->format, 0, 255, 0);
+    SDL_SetColorKey(s, SDL_TRUE, colorKey);
+  }
+
+  SDL_Surface *scaled = SDL_CreateRGBSurfaceWithFormat(0, outW, outH, 32, s->format->format);
+  if (!scaled) {
+    SDL_FreeSurface(s);
+    return nullptr;
+  }
+  SDL_SetSurfaceBlendMode(s, SDL_BLENDMODE_NONE);
+  SDL_Rect dst = {0, 0, outW, outH};
+  SDL_BlitScaled(s, nullptr, scaled, &dst);
+
+  g_loadedTex++;
+  SDL_Texture *t = SDL_CreateTextureFromSurface(g_ren, scaled);
+  SDL_FreeSurface(scaled);
+  SDL_FreeSurface(s);
+  if (t) {
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+  }
+  return t;
 }
 
 void destroyTex(SDL_Texture *&t) {
@@ -413,8 +603,276 @@ Mix_Music *loadBgmByName(const char *name) {
   return m;
 }
 
+const char *bgHillsName(LevelTheme t) {
+  switch (t) {
+  case THEME_OVERWORLD:
+    return "Overworld";
+  case THEME_UNDERGROUND:
+    return "Underground";
+  case THEME_CASTLE:
+    return "Castle";
+  case THEME_UNDERWATER:
+    return "Underwater";
+  case THEME_AIRSHIP:
+    return "Airship";
+  case THEME_DESERT:
+    return "Desert";
+  case THEME_SNOW:
+    return "Snow";
+  case THEME_JUNGLE:
+    return "Jungle";
+  case THEME_BEACH:
+    return "Beach";
+  case THEME_GARDEN:
+    return "GardenHill";
+  case THEME_MOUNTAIN:
+    return "Mountain";
+  case THEME_SKY:
+    return "Sky";
+  case THEME_AUTUMN:
+    return "Autumn";
+  case THEME_PIPELAND:
+    return "Pipeland";
+  case THEME_SPACE:
+    return "Space";
+  case THEME_VOLCANO:
+    return "Volcano";
+  case THEME_GHOSTHOUSE:
+    return "GhostHouse";
+  case THEME_CASTLE_WATER:
+    return "CastleWater";
+  case THEME_BONUS:
+    return "Bonus";
+  default:
+    return "Overworld";
+  }
+}
+
+const char *bgBushesName(LevelTheme t) {
+  switch (t) {
+  case THEME_UNDERGROUND:
+    return "UndergroundBush";
+  case THEME_CASTLE:
+    return "CastleBush";
+  case THEME_CASTLE_WATER:
+    return "CastleWaterBush";
+  case THEME_UNDERWATER:
+    return "UnderwaterBush";
+  case THEME_AIRSHIP:
+    return "AirshipBush";
+  case THEME_DESERT:
+    return "DesertBush";
+  case THEME_SNOW:
+    return "SnowBush";
+  case THEME_JUNGLE:
+    return "JungleBush";
+  case THEME_GARDEN:
+    return "GardenBush";
+  case THEME_AUTUMN:
+    return "AutumnBush";
+  case THEME_VOLCANO:
+    return "VolcanoBush";
+  case THEME_GHOSTHOUSE:
+    return "GhostHouseBush";
+  case THEME_SPACE:
+    return "SpaceBush";
+  case THEME_BONUS:
+    return "BonusBush";
+  case THEME_OVERWORLD:
+  case THEME_BEACH:
+  case THEME_MOUNTAIN:
+  case THEME_SKY:
+  case THEME_PIPELAND:
+  default:
+    return "Bush";
+  }
+}
+
+void loadBackgroundArt() {
+  destroyTex(g_texBgHills);
+  destroyTex(g_texBgBushes);
+  destroyTex(g_texBgCloudOverlay);
+  destroyTex(g_texBgSky);
+  destroyTex(g_texBgSecondary);
+
+  char path[512];
+  auto tryLoadBg = [&](const char *dir, const char *file) -> SDL_Texture * {
+    // Cap `file` to avoid -Wformat-truncation warnings (our filenames are tiny).
+    snprintf(path, sizeof(path), "sprites/Backgrounds/%s/%.*s", dir, 400, file);
+    return loadTex(path);
+  };
+  auto tryLoadBgName = [&](const char *dir, const char *base,
+                           bool nightMode) -> SDL_Texture * {
+    // Prefer LL variants; many non-LL files are chroma-key sources (green).
+    if (nightMode) {
+      // Some underwater assets use ...LLNight instead of ...NightLL.
+      snprintf(path, sizeof(path), "%sNightLL.png", base);
+      if (auto *t = tryLoadBg(dir, path))
+        return t;
+      snprintf(path, sizeof(path), "%sLLNight.png", base);
+      if (auto *t = tryLoadBg(dir, path))
+        return t;
+      snprintf(path, sizeof(path), "%sNight.png", base);
+      if (auto *t = tryLoadBg(dir, path))
+        return t;
+    }
+    snprintf(path, sizeof(path), "%sLL.png", base);
+    if (auto *t = tryLoadBg(dir, path))
+      return t;
+    snprintf(path, sizeof(path), "%s.png", base);
+    return tryLoadBg(dir, path);
+  };
+
+  const char *hillsBase = bgHillsName(g_theme);
+  g_texBgHills = tryLoadBgName("Hills", hillsBase, g_nightMode);
+  if (!g_texBgHills) {
+    g_texBgHills = tryLoadBgName("Hills", themeName(g_theme), g_nightMode);
+  }
+
+  const char *bushBase = bgBushesName(g_theme);
+  g_texBgBushes = tryLoadBgName("Bushes", bushBase, g_nightMode);
+  if (!g_texBgBushes) {
+    g_texBgBushes = tryLoadBgName("Bushes", "Bush", g_nightMode);
+  }
+
+  // Overlays: prefer LL; the non-LL overlay is a green chroma source.
+  g_texBgCloudOverlay =
+      loadTex("sprites/Backgrounds/CloudOverlays/CloudOverlayLL.png");
+  if (!g_texBgCloudOverlay) {
+    g_texBgCloudOverlay =
+        loadTex("sprites/Backgrounds/CloudOverlays/CloudOverlay.png");
+  }
+
+  // Sky texture (optional). The current game clears to a flat color, but
+  // adding the subtle sky pass helps match the Godot project's look.
+  const char *skyBase = nullptr;
+  if (g_nightMode) {
+    if (g_theme == THEME_SNOW)
+      skyBase = "SnowNightStars";
+    else if (g_theme == THEME_SPACE)
+      skyBase = "SpaceStars";
+    else
+      skyBase = "NightStars";
+    g_texBgSky = tryLoadBgName("Skies", skyBase, false);
+  } else {
+    switch (g_theme) {
+    case THEME_BEACH:
+      skyBase = "BeachSky";
+      break;
+    case THEME_AUTUMN:
+      skyBase = "AutumnSky";
+      break;
+    case THEME_VOLCANO:
+      skyBase = "VolcanoSky";
+      break;
+    case THEME_SPACE:
+      skyBase = "TheVoid";
+      break;
+    case THEME_SNOW:
+      skyBase = "SnowSky";
+      break;
+    default:
+      skyBase = "DaySky";
+      break;
+    }
+    g_texBgSky = tryLoadBgName("Skies", skyBase, false);
+  }
+
+  // Foreground (behind player) themed layer: Trees/Mushrooms.
+  int secondary = g_levelInfo.bgSecondary;
+  if (secondary == 0 && g_theme == THEME_OVERWORLD) {
+    // SMB1-style overworld generally benefits from the extra mid layer.
+    secondary = 2;
+  }
+
+  if (secondary == 1) {
+    // Mushrooms use a suffix Night convention (e.g. BeachMushroomsNight).
+    const char *base = nullptr;
+    switch (g_theme) {
+    case THEME_BEACH:
+      base = "BeachMushrooms";
+      break;
+    case THEME_SNOW:
+      base = "SnowMushrooms";
+      break;
+    case THEME_UNDERWATER:
+    case THEME_CASTLE_WATER:
+      base = "UnderwaterMushrooms";
+      break;
+    case THEME_AIRSHIP:
+      base = "AirshipMushrooms";
+      break;
+    default:
+      base = "Mushrooms";
+      break;
+    }
+    g_texBgSecondary = tryLoadBgName("SecondaryMushrooms", base, g_nightMode);
+  } else if (secondary == 2) {
+    // Trees mostly use an infix Night convention (e.g. JungleNightTrees).
+    const char *day = nullptr;
+    const char *night = nullptr;
+    switch (g_theme) {
+    case THEME_UNDERWATER:
+    case THEME_CASTLE_WATER:
+      day = "UnderwaterTrees";
+      night = "UnderwaterTreesNight";
+      break;
+    case THEME_UNDERGROUND:
+    case THEME_GHOSTHOUSE:
+      day = "UndergroundTrees";
+      night = "UndergroundTrees";
+      break;
+    case THEME_JUNGLE:
+      day = "JungleTrees";
+      night = "JungleNightTrees";
+      break;
+    case THEME_SNOW:
+      day = "SnowTrees";
+      night = "SnowNightTrees";
+      break;
+    case THEME_AUTUMN:
+      day = "AutumnTrees";
+      night = "AutumnNightTrees";
+      break;
+    case THEME_BEACH:
+      day = "BeachTrees";
+      night = "BeachNightTrees";
+      break;
+    case THEME_CASTLE:
+      day = "CastleTrees";
+      night = "CastleNightTrees";
+      break;
+    case THEME_SPACE:
+      day = "SpaceTrees";
+      night = "SpaceTrees";
+      break;
+    case THEME_VOLCANO:
+      day = "VolcanoTrees";
+      night = "VolcanoTrees";
+      break;
+    case THEME_BONUS:
+      day = "BonusTrees";
+      night = "BonusTreesNight";
+      break;
+    default:
+      day = "Trees";
+      night = "NightTrees";
+      break;
+    }
+    if (g_nightMode) {
+      g_texBgSecondary = tryLoadBgName("SecondaryTrees", night, false);
+      if (!g_texBgSecondary)
+        g_texBgSecondary = tryLoadBgName("SecondaryTrees", day, false);
+    } else {
+      g_texBgSecondary = tryLoadBgName("SecondaryTrees", day, false);
+    }
+  }
+}
+
 void loadThemeTilesets() {
   destroyTex(g_texTerrain);
+  destroyTex(g_texDeco);
+  destroyTex(g_texLiquids);
   char path[256];
   snprintf(path, sizeof(path), "tilesets/Terrain/%s.png", themeName(g_theme));
   g_texTerrain = loadTex(path);
@@ -423,6 +881,17 @@ void loadThemeTilesets() {
     snprintf(path, sizeof(path), "sprites/tilesets/%s.png", themeName(g_theme));
     g_texTerrain = loadTex(path);
   }
+
+  snprintf(path, sizeof(path), "tilesets/Deco/%sDeco.png", themeName(g_theme));
+  g_texDeco = loadTex(path);
+  if (!g_texDeco) {
+    snprintf(path, sizeof(path), "sprites/tilesets/Deco/%sDeco.png", themeName(g_theme));
+    g_texDeco = loadTex(path);
+  }
+
+  g_texLiquids = loadTex("tilesets/Liquids.png");
+  if (!g_texLiquids)
+    g_texLiquids = loadTex("sprites/tilesets/Liquids.png");
 }
 
 Mix_Music *themeMusic(LevelTheme t) {
@@ -492,10 +961,12 @@ void loadAssets() {
   g_texFlag = loadTex("sprites/tilesets/Flag.png");
   g_texCastle = loadTex("sprites/tilesets/EndingCastleSprite.png");
   loadThemeTilesets();
+  loadBackgroundArt();
 
-  g_texTitle = loadTex("sprites/ui/TitleSMB1.png");
+  g_texTitle = loadTex("sprites/ui/Title2.png");
   g_texCursor = loadTex("sprites/ui/Cursor.png");
   g_texMenuBG = loadTex("sprites/ui/MenuBG.png");
+  g_texCoinIcon = loadTex("sprites/ui/CoinIcon.png");
 
   const char *sfxPaths[] = {"content/audio/sfx/%s", "../content/audio/sfx/%s",
                             "fs:/vol/content/audio/sfx/%s"};
@@ -617,6 +1088,9 @@ void loadAssets() {
   setSfxVolume(g_sfxPipe);
   setSfxVolume(g_sfxKick);
   setSfxVolume(g_sfxFireball);
+
+  // Keep plenty of channels available so short SFX (like brick breaks) don't
+  // get dropped during busy scenes.
 }
 
 void spawnEnemiesFromLevel() {
@@ -641,6 +1115,291 @@ void spawnEnemiesFromLevel() {
   }
 }
 
+static void generateForegroundDecos() {
+  g_fgDecoCount = 0;
+  if (!g_texDeco)
+    return;
+
+  int w = mapWidth();
+
+  // Avoid overlapping pipes and other key objects. PipeLink metadata only
+  // exists for warp pipes, but we want to avoid *any* pipe tiles.
+	  auto decoNearPipe = [&](int tx, int ty, int wTiles, int hTiles) -> bool {
+    constexpr int kMarginX = 3;
+    constexpr int kMarginY = 3;
+    int left = tx - kMarginX;
+    int right = tx + wTiles - 1 + kMarginX;
+    int top = (ty - (hTiles - 1)) - kMarginY;
+    int bottom = (ty + 1) + kMarginY; // include support row
+	    for (int y = top; y <= bottom; y++) {
+	      if (y < 0 || y >= MAP_H)
+	        continue;
+	      for (int x = left; x <= right; x++) {
+	        if (x < 0 || x >= w)
+	          continue;
+	        if (g_map[y][x] == T_PIPE)
+	          return true;
+	      }
+	    }
+	    // Also avoid known pipe mouths from metadata (covers atlas-rendered pipes).
+	    if (g_levelInfo.pipes && g_levelInfo.pipeCount > 0) {
+	      SDL_Rect decoRect = {tx * TILE, (ty - (hTiles - 1)) * TILE, wTiles * TILE,
+	                           hTiles * TILE};
+	      for (int i = 0; i < g_levelInfo.pipeCount; i++) {
+	        const PipeLink &p = g_levelInfo.pipes[i];
+	        SDL_Rect mouth = {p.x * TILE, p.y * TILE, 2 * TILE, 2 * TILE};
+	        SDL_Rect expanded = {mouth.x - 3 * TILE, mouth.y - 3 * TILE,
+	                             mouth.w + 6 * TILE, mouth.h + 6 * TILE};
+	        if (SDL_HasIntersection(&decoRect, &expanded))
+	          return true;
+	      }
+	    }
+	    return false;
+	  };
+
+  // Local RNG: stable per-load and doesn't affect gameplay RNG.
+  uint32_t rng = (uint32_t)SDL_GetTicks();
+  rng ^= (uint32_t)(g_levelIndex * 0x9E3779B1u);
+  rng ^= (uint32_t)(g_sectionIndex * 0x85EBCA6Bu);
+  rng ^= (uint32_t)(g_theme * 0xC2B2AE35u);
+  auto nextU32 = [&]() -> uint32_t {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+  };
+
+  auto inBounds = [&](int tx, int ty) -> bool {
+    return tx >= 0 && tx < w && ty >= 0 && ty < MAP_H;
+  };
+
+  auto isEmptyTile = [&](int tx, int ty) -> bool {
+    if (!inBounds(tx, ty))
+      return false;
+    return g_map[ty][tx] == T_EMPTY || g_map[ty][tx] == T_COIN;
+  };
+
+  auto areaEmpty = [&](int tx, int ty, int wTiles, int hTiles) -> bool {
+    for (int y = 0; y < hTiles; y++) {
+      for (int x = 0; x < wTiles; x++) {
+        if (!isEmptyTile(tx + x, ty + y))
+          return false;
+      }
+    }
+    return true;
+  };
+
+  auto supportIsGround = [&](int tx, int ty) -> bool {
+    if (!inBounds(tx, ty))
+      return false;
+    // Allow any solid/one-way floor as support, but avoid pipe-stamped safety
+    // tiles and other special gameplay blocks.
+    uint8_t tile = g_map[ty][tx];
+    if (tile == T_EMPTY)
+      return false;
+    if (tile == T_PIPE || tile == T_QUESTION || tile == T_USED || tile == T_BRICK ||
+        tile == T_CASTLE)
+      return false;
+    uint8_t col = collisionAt(tx, ty);
+    return col == COL_SOLID || col == COL_ONEWAY;
+  };
+
+	  struct Pattern {
+	    uint8_t w;
+	    uint8_t h;
+	    uint8_t cellCount;
+	    ForegroundDeco::Cell cells[16];
+	  };
+
+	  // Extract patterns from the level's *placed* deco tiles. In the remastered
+	  // project, a single "deco object" is made of multiple connected tiles, but
+	  // the atlas itself is densely packed and can't be segmented reliably.
+	  std::vector<Pattern> patterns;
+	  {
+	    if (!g_levelInfo.atlasT || !g_levelInfo.atlasX || !g_levelInfo.atlasY)
+	      return;
+	    int mw = mapWidth();
+	    std::vector<uint8_t> vis(mw * MAP_H, 0);
+	    auto vidx = [&](int tx, int ty) { return ty * mw + tx; };
+	    auto isDeco = [&](int tx, int ty) -> bool {
+	      if (tx < 0 || tx >= mw || ty < 0 || ty >= MAP_H)
+	        return false;
+	      uint8_t ax = g_levelInfo.atlasX[ty][tx];
+	      uint8_t ay = g_levelInfo.atlasY[ty][tx];
+	      if (ax == 255 || ay == 255)
+	        return false;
+	      return g_levelInfo.atlasT[ty][tx] == ATLAS_DECO;
+	    };
+	    auto keyFor = [&](Pattern &p) -> std::string {
+	      // Sort cells for stable key
+	      for (int i = 0; i < p.cellCount; i++) {
+	        for (int j = i + 1; j < p.cellCount; j++) {
+	          const auto &a = p.cells[i];
+	          const auto &b = p.cells[j];
+	          if (a.dy != b.dy)
+	            continue;
+	          if (a.dx != b.dx)
+	            continue;
+	        }
+	      }
+	      // Simple string key
+	      std::string k;
+	      k.reserve(64);
+	      k += std::to_string(p.w) + "x" + std::to_string(p.h) + ":";
+	      for (int i = 0; i < p.cellCount; i++) {
+	        const auto &c = p.cells[i];
+	        k += std::to_string((int)c.dx) + "," + std::to_string((int)c.dy) +
+	             "," + std::to_string((int)c.ax) + "," +
+	             std::to_string((int)c.ay) + ";";
+	      }
+	      return k;
+	    };
+
+	    std::vector<std::string> keys;
+	    keys.reserve(64);
+
+	    const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+	    for (int ty = 0; ty < MAP_H; ty++) {
+	      for (int tx = 0; tx < mw; tx++) {
+	        if (!isDeco(tx, ty) || vis[vidx(tx, ty)])
+	          continue;
+	        std::vector<std::pair<int, int>> q;
+	        q.push_back({tx, ty});
+	        vis[vidx(tx, ty)] = 1;
+	        int minTx = tx, maxTx = tx, minTy = ty, maxTy = ty;
+	        for (size_t qi = 0; qi < q.size(); qi++) {
+	          auto [cx, cy] = q[qi];
+	          if (cx < minTx)
+	            minTx = cx;
+	          if (cx > maxTx)
+	            maxTx = cx;
+	          if (cy < minTy)
+	            minTy = cy;
+	          if (cy > maxTy)
+	            maxTy = cy;
+	          for (auto &d : dirs) {
+	            int nx = cx + d[0];
+	            int ny = cy + d[1];
+	            if (nx < 0 || nx >= mw || ny < 0 || ny >= MAP_H)
+	              continue;
+	            if (!isDeco(nx, ny) || vis[vidx(nx, ny)])
+	              continue;
+	            vis[vidx(nx, ny)] = 1;
+	            q.push_back({nx, ny});
+	          }
+	        }
+
+	        int pw = maxTx - minTx + 1;
+	        int ph = maxTy - minTy + 1;
+	        if (pw <= 0 || ph <= 0)
+	          continue;
+	        // Skip huge components (these are usually decorative backgrounds baked
+	        // into the tilemap, not "placeable" foreground objects).
+	        if (pw > 6 || ph > 4 || (int)q.size() > 16)
+	          continue;
+
+	        Pattern pat = {};
+	        pat.w = (uint8_t)pw;
+	        pat.h = (uint8_t)ph;
+	        int bottomTy = maxTy;
+	        for (auto &cell : q) {
+	          if (pat.cellCount >=
+	              (uint8_t)(sizeof(pat.cells) / sizeof(pat.cells[0])))
+	            break;
+	          int cx = cell.first;
+	          int cy = cell.second;
+	          pat.cells[pat.cellCount++] = {
+	              (int8_t)(cx - minTx),
+	              (int8_t)(cy - bottomTy),
+	              g_levelInfo.atlasX[cy][cx],
+	              g_levelInfo.atlasY[cy][cx],
+	          };
+	        }
+
+	        std::string k = keyFor(pat);
+	        bool dup = false;
+	        for (auto &existing : keys) {
+	          if (existing == k) {
+	            dup = true;
+	            break;
+	          }
+	        }
+	        if (!dup) {
+	          keys.push_back(std::move(k));
+	          patterns.push_back(pat);
+	        }
+	      }
+	    }
+	  }
+	  if (patterns.empty())
+	    return;
+
+  // Extra clearance so larger decos don't clip into nearby objects.
+  constexpr int kPadX = 3;
+  constexpr int kPadY = 1;
+
+  int desired = 10 + w / 40;
+  if (desired > 28)
+    desired = 28;
+
+	  int attempts = 0;
+	  while (g_fgDecoCount < desired && attempts++ < 800) {
+	    const Pattern &pat = patterns[(int)(nextU32() % (uint32_t)patterns.size())];
+
+    if (w <= pat.w + kPadX * 2)
+      continue;
+
+    int minTx = kPadX;
+    int maxTx = w - (int)pat.w - kPadX;
+    if (maxTx < minTx)
+      continue;
+    int tx = minTx + (int)(nextU32() % (uint32_t)(maxTx - minTx + 1));
+
+    for (int ty = MAP_H - 3; ty >= 2; ty--) {
+      if (ty - (int)(pat.h - 1) < 0)
+        continue;
+      // Keep clutter down by avoiding very high platforms.
+      if (ty < 8)
+        continue;
+
+      // The whole footprint must be empty.
+      if (!areaEmpty(tx, ty - (int)(pat.h - 1), pat.w, pat.h))
+        continue;
+
+	      // Require solid support under every bottom cell in the pattern (prevents
+	      // placing on pipes/blocks and avoids impossible overhangs).
+	      bool supported = true;
+	      for (int c = 0; c < pat.cellCount; c++) {
+	        const auto &cell = pat.cells[c];
+	        if (cell.dy != 0)
+	          continue;
+	        int sx = tx + cell.dx;
+	        if (!supportIsGround(sx, ty + 1)) {
+	          supported = false;
+	          break;
+	        }
+	      }
+	      if (!supported)
+	        continue;
+
+      int clearX = tx - kPadX;
+      int clearY = (ty - (int)(pat.h - 1)) - kPadY;
+      int clearW = pat.w + kPadX * 2;
+      int clearH = pat.h + kPadY;
+      if (!areaEmpty(clearX, clearY, clearW, clearH))
+        continue;
+      if (decoNearPipe(tx, ty, pat.w, pat.h))
+        continue;
+
+	      if (g_fgDecoCount < (int)(sizeof(g_fgDecos) / sizeof(g_fgDecos[0]))) {
+	        ForegroundDeco d = {tx, ty, pat.w, pat.h, pat.cellCount, {}};
+	        for (int i = 0; i < pat.cellCount; i++)
+	          d.cells[i] = pat.cells[i];
+	        g_fgDecos[g_fgDecoCount++] = d;
+	      }
+	      break;
+	    }
+	  }
+}
+
 void applySection(bool resetTimer, int spawnX, int spawnY) {
   LevelTheme chosen = g_levelInfo.theme;
   if (g_randomTheme) {
@@ -657,6 +1416,7 @@ void applySection(bool resetTimer, int spawnX, int spawnY) {
   g_flagX = g_levelInfo.flagX;
   g_hasFlag = g_levelInfo.hasFlag;
   loadThemeTilesets();
+  loadBackgroundArt();
 
   g_p.dead = false;
   g_p.r = {(float)spawnX, (float)(spawnY - g_p.r.h), g_p.r.w, g_p.r.h};
@@ -668,6 +1428,7 @@ void applySection(bool resetTimer, int spawnX, int spawnY) {
   g_p.crouch = false;
   g_p.invT = 0;
   g_p.animT = 0;
+  g_p.throwT = 0;
   g_fireCooldown = 0.0f;
   g_flagSfxPlayed = false;
   g_castleSfxPlayed = false;
@@ -679,6 +1440,7 @@ void applySection(bool resetTimer, int spawnX, int spawnY) {
   }
   g_flagY = 3 * TILE;
   spawnEnemiesFromLevel();
+  generateForegroundDecos();
   g_state = GS_PLAYING;
   playThemeMusic(g_theme);
 }
@@ -696,16 +1458,16 @@ void startNewGame() {
   g_p.coins = 0;
   g_p.score = 0;
   g_p.power = P_SMALL;
-  g_p.r.w = 14;
-  g_p.r.h = 16;
+  g_p.r.w = PLAYER_HIT_W_SMALL;
+  g_p.r.h = PLAYER_HIT_H_SMALL;
   g_p.crouch = false;
   setupLevel();
 }
 
 void restartLevel() {
   g_p.power = P_SMALL;
-  g_p.r.w = 14;
-  g_p.r.h = 16;
+  g_p.r.w = PLAYER_HIT_W_SMALL;
+  g_p.r.h = PLAYER_HIT_H_SMALL;
   g_p.crouch = false;
   setupLevel();
 }
@@ -719,6 +1481,10 @@ void nextLevel() {
 }
 
 void input() {
+  // Default to "no input" so a dropped VPAD read doesn't leave stale buttons.
+  g_pressed = 0;
+  g_held = 0;
+
   VPADStatus vpad;
   VPADReadError err;
   VPADRead(VPAD_CHAN_0, &vpad, 1, &err);
@@ -737,7 +1503,34 @@ void input() {
 }
 
 void updateTitle() {
-  if (g_titleMode == TITLE_CHAR_SELECT) {
+  switch (g_titleMode) {
+  case TITLE_MAIN: {
+    constexpr int kCount = 3; // PLAY, SETTINGS, EXTRAS
+    if (g_pressed & VPAD_BUTTON_UP) {
+      g_mainMenuIndex = (g_mainMenuIndex + kCount - 1) % kCount;
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    } else if (g_pressed & VPAD_BUTTON_DOWN) {
+      g_mainMenuIndex = (g_mainMenuIndex + 1) % kCount;
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    }
+    if (g_pressed & VPAD_BUTTON_A) {
+      if (g_mainMenuIndex == 0) {
+        g_titleMode = TITLE_CHAR_SELECT;
+        g_menuIndex = g_charIndex;
+      } else if (g_mainMenuIndex == 1) {
+        g_titleMode = TITLE_OPTIONS;
+        g_optionsIndex = 0;
+      } else {
+        g_titleMode = TITLE_EXTRAS;
+      }
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    }
+    break;
+  }
+  case TITLE_CHAR_SELECT: {
     if (g_pressed & VPAD_BUTTON_LEFT) {
       g_menuIndex = (g_menuIndex + g_charCount - 1) % g_charCount;
       if (g_sfxMenuMove)
@@ -755,11 +1548,19 @@ void updateTitle() {
         Mix_PlayChannel(-1, g_sfxMenuMove, 0);
     }
 
+    if (g_pressed & VPAD_BUTTON_B) {
+      g_titleMode = TITLE_MAIN;
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    }
+
     if (g_pressed & VPAD_BUTTON_A) {
       g_charIndex = g_menuIndex;
       startNewGame();
     }
-  } else {
+    break;
+  }
+  case TITLE_OPTIONS: {
     if (g_pressed & VPAD_BUTTON_UP) {
       g_optionsIndex = (g_optionsIndex + 2 - 1) % 2;
       if (g_sfxMenuMove)
@@ -783,10 +1584,23 @@ void updateTitle() {
     }
 
     if (g_pressed & VPAD_BUTTON_B) {
-      g_titleMode = TITLE_CHAR_SELECT;
+      g_titleMode = TITLE_MAIN;
       if (g_sfxMenuMove)
         Mix_PlayChannel(-1, g_sfxMenuMove, 0);
     }
+    break;
+  }
+  case TITLE_EXTRAS: {
+    if (g_pressed & VPAD_BUTTON_B) {
+      g_titleMode = TITLE_MAIN;
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    }
+    break;
+  }
+  default:
+    g_titleMode = TITLE_MAIN;
+    break;
   }
 }
 
@@ -829,7 +1643,7 @@ void updatePauseMenu() {
       break;
     case 4: // Main menu
       g_state = GS_TITLE;
-      g_titleMode = TITLE_CHAR_SELECT;
+      g_titleMode = TITLE_MAIN;
       g_menuIndex = g_charIndex;
       Mix_HaltMusic();
       break;
@@ -891,6 +1705,7 @@ void spawnFireball() {
       float y = g_p.r.y + (g_p.r.h * 0.5f);
       g_ents[i] = {true, E_FIREBALL, {x, y, 16, 16}, 0, -120, g_p.right ? 1 : -1, 0, 0};
       g_fireCooldown = 0.35f;
+      g_p.throwT = 0.15f;
       if (g_sfxFireball)
         Mix_PlayChannel(-1, g_sfxFireball, 0);
       break;
@@ -912,8 +1727,20 @@ bool tryPipeEnter(const PipeLink &p) {
 void updatePlayer(float dt) {
   if (g_p.dead || g_state == GS_FLAG)
     return;
+  for (auto &b : g_tileBumps) {
+    if (b.t > 0.0f) {
+      b.t -= dt;
+      if (b.t < 0.0f)
+        b.t = 0.0f;
+    }
+  }
   if (g_p.invT > 0)
     g_p.invT -= dt;
+  if (g_p.throwT > 0.0f) {
+    g_p.throwT -= dt;
+    if (g_p.throwT < 0.0f)
+      g_p.throwT = 0.0f;
+  }
   if (g_fireCooldown > 0.0f)
     g_fireCooldown -= dt;
   g_p.animT += dt;
@@ -935,62 +1762,46 @@ void updatePlayer(float dt) {
   }
 
   if (g_levelInfo.pipes && g_levelInfo.pipeCount > 0) {
-    float midY = g_p.r.y + g_p.r.h * 0.5f;
-    float midX = g_p.r.x + g_p.r.w * 0.5f;
-
-    auto pipeAt = [&](int x, int y) -> bool {
-      return y >= 0 && y < MAP_H && x >= 0 && x < mapWidth() &&
-             g_map[y][x] == T_PIPE;
-    };
-
     for (int i = 0; i < g_levelInfo.pipeCount; i++) {
       const PipeLink &p = g_levelInfo.pipes[i];
-      int px = p.x * TILE;
-      int topTile = p.y;
-      while (topTile > 0 &&
-             (pipeAt(p.x, topTile - 1) || pipeAt(p.x + 1, topTile - 1))) {
-        topTile--;
-      }
-      int heightTiles = 1;
-      for (int y = topTile; y < MAP_H; y++) {
-        if (pipeAt(p.x, y) || pipeAt(p.x + 1, y))
-          heightTiles = y - topTile + 1;
-        else
-          break;
-      }
-      SDL_Rect pipeRect = {px, topTile * TILE, TILE * 2, TILE * heightTiles};
-      bool overlapY =
-          (midY >= pipeRect.y - 4 && midY <= pipeRect.y + pipeRect.h + 4);
-      bool overPipeX =
-          (midX >= pipeRect.x + 2 && midX <= pipeRect.x + pipeRect.w - 2);
+      // Use the PipeArea node location as the "mouth" area. This avoids
+      // depending on tile classification (pipes use many atlas tiles) and fixes
+      // sideways pipes that don't form a simple vertical column.
+      float px = p.x * TILE;
+      float py = p.y * TILE;
+      SDL_FRect mouth = {px, py, TILE * 2.0f, TILE * 2.0f};
+
+      float midX = g_p.r.x + g_p.r.w * 0.5f;
+      float midY = g_p.r.y + g_p.r.h * 0.5f;
+      bool overlapY = (midY >= mouth.y - 8.0f && midY <= mouth.y + mouth.h + 8.0f);
+      bool overMouthX = (midX >= mouth.x + 2 && midX <= mouth.x + mouth.w - 2);
+      constexpr float kEdgeEps = 6.0f;
 
       switch (p.enterDir) {
       case 0: // Down
-        if (downHeld && g_p.ground && overPipeX &&
-            fabsf((g_p.r.y + g_p.r.h) - pipeRect.y) <= 6.0f) {
+        if (downHeld && g_p.ground && overMouthX &&
+            fabsf((g_p.r.y + g_p.r.h) - mouth.y) <= 8.0f) {
           if (tryPipeEnter(p))
             return;
         }
         break;
       case 1: // Up
-        if ((g_held & VPAD_BUTTON_UP) && overPipeX &&
-            fabsf(g_p.r.y - (pipeRect.y + pipeRect.h)) <= 6.0f) {
+        if ((g_held & VPAD_BUTTON_UP) && overMouthX &&
+            fabsf(g_p.r.y - (mouth.y + mouth.h)) <= 8.0f) {
           if (tryPipeEnter(p))
             return;
         }
         break;
       case 2: // Left
-        if ((g_held & VPAD_BUTTON_LEFT) && overlapY &&
-            g_p.r.x <= pipeRect.x + 2 &&
-            g_p.r.x + g_p.r.w > pipeRect.x - 2) {
+        if ((g_held & VPAD_BUTTON_LEFT) && g_p.ground && overlapY &&
+            fabsf(g_p.r.x - (mouth.x + mouth.w)) <= kEdgeEps) {
           if (tryPipeEnter(p))
             return;
         }
         break;
       case 3: // Right
-        if ((g_held & VPAD_BUTTON_RIGHT) && overlapY &&
-            g_p.r.x + g_p.r.w >= pipeRect.x + pipeRect.w - 2 &&
-            g_p.r.x < pipeRect.x + pipeRect.w + 2) {
+        if ((g_held & VPAD_BUTTON_RIGHT) && g_p.ground && overlapY &&
+            fabsf((g_p.r.x + g_p.r.w) - mouth.x) <= kEdgeEps) {
           if (tryPipeEnter(p))
             return;
         }
@@ -1004,17 +1815,29 @@ void updatePlayer(float dt) {
   if (g_p.power >= P_BIG && g_p.ground) {
     if (downHeld && !g_p.crouch) {
       g_p.crouch = true;
-      g_p.r.h = 16;
-      g_p.r.y += 16;
+      setPlayerSizePreserveFeet(PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
     } else if (!downHeld && g_p.crouch) {
-      g_p.crouch = false;
-      g_p.r.y -= 16;
-      g_p.r.h = 32;
+      // Only stand up if there's headroom.
+      Rect standRect = g_p.r;
+      standRect.h = standHeightForPower(g_p.power);
+      standRect.y = (g_p.r.y + g_p.r.h) - standRect.h;
+      standRect.w = PLAYER_HIT_W_BIG;
+      if (!rectBlockedBySolids(standRect)) {
+        g_p.crouch = false;
+        setPlayerSizePreserveFeet(PLAYER_HIT_W_BIG, standRect.h);
+      }
     }
   } else if (g_p.crouch) {
-    g_p.crouch = false;
-    g_p.r.y -= 16;
-    g_p.r.h = 32;
+    // If we left the ground while crouched, try to stand (but don't force it if
+    // we'd clip).
+    Rect standRect = g_p.r;
+    standRect.h = standHeightForPower(g_p.power);
+    standRect.y = (g_p.r.y + g_p.r.h) - standRect.h;
+    standRect.w = PLAYER_HIT_W_BIG;
+    if (!rectBlockedBySolids(standRect)) {
+      g_p.crouch = false;
+      setPlayerSizePreserveFeet(PLAYER_HIT_W_BIG, standRect.h);
+    }
   }
 
   if (g_p.crouch) {
@@ -1121,55 +1944,98 @@ void updatePlayer(float dt) {
     g_p.r.y += stepY;
     // Y collision (per step)
     int ty1 = (int)(g_p.r.y / TILE);
-    int ty2 = (int)((g_p.r.y + g_p.r.h) / TILE);
+    // When moving down, include the tile boundary at the player's feet to avoid
+    // "ground" flicker when landing exactly on an edge.
+    int ty2 = (stepY >= 0) ? (int)((g_p.r.y + g_p.r.h) / TILE)
+                           : (int)((g_p.r.y + g_p.r.h - 1) / TILE);
     int tx1 = (int)(g_p.r.x / TILE);
     int tx2 = (int)((g_p.r.x + g_p.r.w - 1) / TILE);
     bool hit = false;
     for (int ty = ty1; ty <= ty2; ty++) {
       for (int tx = tx1; tx <= tx2; tx++) {
-        if (solidAt(tx, ty)) {
-          uint8_t tile = g_map[ty][tx];
-          if (g_p.vy > 0) {
-            g_p.r.y = ty * TILE - g_p.r.h;
-            g_p.vy = 0;
-            g_p.ground = true;
-            g_p.jumping = false;
-            hit = true;
-          } else if (g_p.vy < 0) {
-            g_p.r.y = (ty + 1) * TILE;
-            g_p.vy = 45;
-            if (tile == T_QUESTION) {
-              g_map[ty][tx] = T_USED;
-              uint8_t meta = questionMetaAt(tx, ty);
-              if (meta == QMETA_POWERUP || meta == QMETA_STAR) {
-                if (g_p.power == P_SMALL)
-                  spawnMushroom(tx, ty);
-                else
-                  spawnFireFlower(tx, ty);
-              } else if (meta == QMETA_ONEUP) {
-                g_p.lives++;
-                g_p.score += 1000;
-                if (g_sfxPowerup)
-                  Mix_PlayChannel(-1, g_sfxPowerup, 0);
-              } else {
-                g_p.coins++;
-                g_p.score += 200;
-                spawnCoinPopup(tx * TILE, ty * TILE);
-              }
-              if (g_sfxBump)
-                Mix_PlayChannel(-1, g_sfxBump, 0);
-            } else if (tile == T_BRICK && g_p.power > P_SMALL) {
-              g_map[ty][tx] = T_EMPTY;
-              g_p.score += 50;
-              if (g_sfxBreak)
-                Mix_PlayChannel(-1, g_sfxBreak, 0);
-            } else if (tile == T_BRICK) {
-              if (g_sfxBump)
-                Mix_PlayChannel(-1, g_sfxBump, 0);
-            }
-            hit = true;
+        uint8_t col = collisionAt(tx, ty);
+        if (col == COL_NONE)
+          continue;
+        uint8_t tile = g_map[ty][tx];
+        if (g_p.vy > 0) {
+          if (col == COL_ONEWAY) {
+            float prevBottom = (g_p.r.y - stepY) + g_p.r.h;
+            float tileTop = ty * TILE;
+            if (prevBottom > tileTop + 0.1f)
+              continue;
           }
-        }
+          g_p.r.y = ty * TILE - g_p.r.h;
+          g_p.vy = 0;
+          g_p.ground = true;
+          g_p.jumping = false;
+          hit = true;
+	        } else if (g_p.vy < 0) {
+	          if (col != COL_SOLID)
+	            continue;
+	          int hitTy = ty;
+	          g_p.r.y = (hitTy + 1) * TILE;
+	          g_p.vy = 45;
+
+	          auto hitBlockAt = [&](int bx, int by) {
+	            if (bx < 0 || bx >= mapWidth() || by < 0 || by >= MAP_H)
+	              return;
+	            if (collisionAt(bx, by) != COL_SOLID)
+	              return;
+	            uint8_t t = g_map[by][bx];
+	            if (t == T_QUESTION) {
+	              g_map[by][bx] = T_USED;
+	              uint8_t meta = questionMetaAt(bx, by);
+	              if (meta == QMETA_POWERUP || meta == QMETA_STAR) {
+	                if (g_p.power == P_SMALL)
+	                  spawnMushroom(bx, by);
+	                else
+	                  spawnFireFlower(bx, by);
+	              } else if (meta == QMETA_ONEUP) {
+	                g_p.lives++;
+	                g_p.score += 1000;
+	                if (g_sfxPowerup)
+	                  Mix_PlayChannel(-1, g_sfxPowerup, 0);
+	              } else {
+	                g_p.coins++;
+	                g_p.score += 200;
+	                spawnCoinPopup(bx * TILE, by * TILE);
+	              }
+	              if (g_sfxBump)
+	                Mix_PlayChannel(-1, g_sfxBump, 0);
+	              return;
+	            }
+	            if (t == T_BRICK && g_p.power > P_SMALL) {
+	              g_map[by][bx] = T_EMPTY;
+	              g_p.score += 50;
+	              if (g_sfxBreak)
+	                Mix_PlayChannel(-1, g_sfxBreak, 0);
+	              return;
+	            }
+	            if (t == T_BRICK) {
+	              if (g_sfxBump)
+	                Mix_PlayChannel(-1, g_sfxBump, 0);
+	              addTileBump(bx, by);
+	              return;
+	            }
+	          };
+
+	          int leftTx = (int)((g_p.r.x + 1) / TILE);
+	          int rightTx = (int)((g_p.r.x + g_p.r.w - 2) / TILE);
+	          float midX = g_p.r.x + g_p.r.w * 0.5f;
+	          float seamX = (leftTx + 1) * (float)TILE;
+	          bool spansTwo = rightTx > leftTx;
+	          bool inSeam = spansTwo && fabsf(midX - seamX) <= 2.0f;
+	          if (inSeam) {
+	            hitBlockAt(leftTx, hitTy);
+	            hitBlockAt(rightTx, hitTy);
+	          } else if (!spansTwo) {
+	            hitBlockAt(leftTx, hitTy);
+	          } else {
+	            int pick = (midX < seamX) ? leftTx : rightTx;
+	            hitBlockAt(pick, hitTy);
+	          }
+	          hit = true;
+	        }
         if (hit)
           break;
       }
@@ -1178,6 +2044,27 @@ void updatePlayer(float dt) {
     }
     if (hit)
       break;
+  }
+
+  // Collect coins embedded in the tilemap.
+  {
+    int tx1 = (int)(g_p.r.x / TILE);
+    int tx2 = (int)((g_p.r.x + g_p.r.w - 1) / TILE);
+    int ty1 = (int)(g_p.r.y / TILE);
+    int ty2 = (int)((g_p.r.y + g_p.r.h - 1) / TILE);
+    for (int ty = ty1; ty <= ty2; ty++) {
+      for (int tx = tx1; tx <= tx2; tx++) {
+        if (tx < 0 || tx >= mapWidth() || ty < 0 || ty >= MAP_H)
+          continue;
+        if (g_map[ty][tx] == T_COIN) {
+          g_map[ty][tx] = T_EMPTY;
+          g_p.coins++;
+          g_p.score += 200;
+          if (g_sfxCoin)
+            Mix_PlayChannel(-1, g_sfxCoin, 0);
+        }
+      }
+    }
   }
 
   // Flag pole collision
@@ -1209,6 +2096,8 @@ void updatePlayer(float dt) {
     g_camX = target;
   int viewTiles = (GAME_W + TILE - 1) / TILE;
   float maxCam = (mapWidth() - viewTiles) * TILE;
+  if (maxCam < 0)
+    maxCam = 0;
   if (g_camX > maxCam)
     g_camX = maxCam;
 }
@@ -1258,9 +2147,20 @@ void updateEntities(float dt) {
 
         int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
         int bottomTy = (int)((e.r.y + e.r.h) / TILE);
-        if (solidAt(midTx, bottomTy)) {
-          e.r.y = bottomTy * TILE - e.r.h;
-          e.vy = 0;
+        {
+          uint8_t col = collisionAt(midTx, bottomTy);
+          if (col == COL_SOLID || col == COL_ONEWAY) {
+            if (col == COL_ONEWAY) {
+              float prevBottom = (e.r.y - (e.vy * dt)) + e.r.h;
+              float tileTop = bottomTy * TILE;
+              if (prevBottom > tileTop + 0.1f)
+                col = COL_NONE;
+            }
+            if (col != COL_NONE) {
+              e.r.y = bottomTy * TILE - e.r.h;
+              e.vy = 0;
+            }
+          }
         }
 
         int frontTx =
@@ -1289,9 +2189,8 @@ void updateEntities(float dt) {
           } else {
             if (g_p.power > P_SMALL) {
               g_p.power = P_SMALL;
-              g_p.r.h = 16;
-              g_p.r.w = 14;
               g_p.crouch = false;
+              setPlayerSizePreserveFeet(PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
               g_p.invT = 2.0f;
               if (g_sfxDamage)
                 Mix_PlayChannel(-1, g_sfxDamage, 0);
@@ -1318,9 +2217,20 @@ void updateEntities(float dt) {
 
       int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
       int bottomTy = (int)((e.r.y + e.r.h) / TILE);
-      if (solidAt(midTx, bottomTy)) {
-        e.r.y = bottomTy * TILE - e.r.h;
-        e.vy = 0;
+      {
+        uint8_t col = collisionAt(midTx, bottomTy);
+        if (col == COL_SOLID || col == COL_ONEWAY) {
+          if (col == COL_ONEWAY) {
+            float prevBottom = (e.r.y - (e.vy * dt)) + e.r.h;
+            float tileTop = bottomTy * TILE;
+            if (prevBottom > tileTop + 0.1f)
+              col = COL_NONE;
+          }
+          if (col != COL_NONE) {
+            e.r.y = bottomTy * TILE - e.r.h;
+            e.vy = 0;
+          }
+        }
       }
 
       int frontTx =
@@ -1365,9 +2275,8 @@ void updateEntities(float dt) {
               Mix_PlayChannel(-1, g_sfxKick, 0);
           } else if (g_p.power > P_SMALL) {
             g_p.power = P_SMALL;
-            g_p.r.h = 16;
-            g_p.r.w = 14;
             g_p.crouch = false;
+            setPlayerSizePreserveFeet(PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
             g_p.invT = 2.0f;
             if (g_sfxDamage)
               Mix_PlayChannel(-1, g_sfxDamage, 0);
@@ -1384,23 +2293,31 @@ void updateEntities(float dt) {
       e.r.x += e.vx * dt * e.dir;
       e.r.y += e.vy * dt;
       int ty = (int)((e.r.y + e.r.h) / TILE);
-      if (ty >= 0 && ty < MAP_H &&
-          g_map[ty][(int)((e.r.x + 8) / TILE)] >= T_GROUND) {
-        e.r.y = ty * TILE - e.r.h;
-        e.vy = 0;
+      {
+        int midTx = (int)((e.r.x + 8) / TILE);
+        uint8_t col = collisionAt(midTx, ty);
+        if (col == COL_SOLID || col == COL_ONEWAY) {
+          if (col == COL_ONEWAY) {
+            float prevBottom = (e.r.y - (e.vy * dt)) + e.r.h;
+            float tileTop = ty * TILE;
+            if (prevBottom > tileTop + 0.1f)
+              col = COL_NONE;
+          }
+          if (col != COL_NONE) {
+            e.r.y = ty * TILE - e.r.h;
+            e.vy = 0;
+          }
+        }
       }
       int tx = e.dir > 0 ? (int)((e.r.x + e.r.w) / TILE) : (int)(e.r.x / TILE);
-      if (tx >= 0 && tx < mapWidth() &&
-          g_map[(int)(e.r.y / TILE)][tx] >= T_GROUND)
+      if (solidAt(tx, (int)(e.r.y / TILE)))
         e.dir = -e.dir;
       if (overlap(g_p.r, e.r)) {
         e.on = false;
         if (g_p.power == P_SMALL) {
           g_p.power = P_BIG;
-          g_p.r.h = 32;
-          g_p.r.y -= 16;
-          g_p.r.w = 16;
           g_p.crouch = false;
+          setPlayerSizePreserveFeet(PLAYER_HIT_W_BIG, PLAYER_HIT_H_BIG);
         }
         g_p.score += 1000;
         if (g_sfxPowerup)
@@ -1413,18 +2330,27 @@ void updateEntities(float dt) {
       e.r.y += e.vy * dt;
       int ty = (int)((e.r.y + e.r.h) / TILE);
       int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
-      if (solidAt(midTx, ty)) {
-        e.r.y = ty * TILE - e.r.h;
-        e.vy = 0;
+      {
+        uint8_t col = collisionAt(midTx, ty);
+        if (col == COL_SOLID || col == COL_ONEWAY) {
+          if (col == COL_ONEWAY) {
+            float prevBottom = (e.r.y - (e.vy * dt)) + e.r.h;
+            float tileTop = ty * TILE;
+            if (prevBottom > tileTop + 0.1f)
+              col = COL_NONE;
+          }
+          if (col != COL_NONE) {
+            e.r.y = ty * TILE - e.r.h;
+            e.vy = 0;
+          }
+        }
       }
       if (overlap(g_p.r, e.r)) {
         e.on = false;
         if (g_p.power == P_SMALL) {
           g_p.power = P_BIG;
-          g_p.r.h = 32;
-          g_p.r.y -= 16;
-          g_p.r.w = 16;
           g_p.crouch = false;
+          setPlayerSizePreserveFeet(PLAYER_HIT_W_BIG, PLAYER_HIT_H_BIG);
         } else {
           g_p.power = P_FIRE;
         }
@@ -1442,9 +2368,20 @@ void updateEntities(float dt) {
 
       int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
       int bottomTy = (int)((e.r.y + e.r.h) / TILE);
-      if (solidAt(midTx, bottomTy)) {
-        e.r.y = bottomTy * TILE - e.r.h;
-        e.vy = -140.0f;
+      {
+        uint8_t col = collisionAt(midTx, bottomTy);
+        if (col == COL_SOLID || col == COL_ONEWAY) {
+          if (col == COL_ONEWAY) {
+            float prevBottom = (e.r.y - (e.vy * dt)) + e.r.h;
+            float tileTop = bottomTy * TILE;
+            if (prevBottom > tileTop + 0.1f)
+              col = COL_NONE;
+          }
+          if (col != COL_NONE) {
+            e.r.y = bottomTy * TILE - e.r.h;
+            e.vy = -140.0f;
+          }
+        }
       }
 
       int frontTx =
@@ -1530,34 +2467,83 @@ void drawTile(int tx, int ty, uint8_t tile) {
   if (x < -TILE || x > GAME_W)
     return;
   SDL_Rect dst = {x, ty * TILE, TILE, TILE};
+  {
+    float lift = 0.0f;
+    float scale = 1.0f;
+    if (bumpTransformForTile(tx, ty, lift, scale)) {
+      int dw = (int)lroundf(TILE * scale);
+      int dh = (int)lroundf(TILE * scale);
+      int extraW = dw - TILE;
+      int extraH = dh - TILE;
+      dst.x -= extraW / 2;
+      dst.y -= extraH;
+      dst.y -= (int)lroundf(lift);
+      dst.w = dw;
+      dst.h = dh;
+    }
+  }
+
+  auto drawBlockShadow = [&]() {
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 90);
+    SDL_Rect s = dst;
+    s.x += 2;
+    s.y += 2;
+    SDL_RenderFillRect(g_ren, &s);
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+  };
+
+  if (tile == T_COIN) {
+    if (g_texCoin) {
+      // Frame 0 of SpinningCoin.png is a solid green placeholder in the current
+      // asset set, so skip it.
+      int frame = 1 + ((SDL_GetTicks() / 120) % 3);
+      SDL_Rect src = {frame * 16, 0, 16, 16};
+      SDL_RenderCopy(g_ren, g_texCoin, &src, &dst);
+    } else {
+      SDL_SetRenderDrawColor(g_ren, 255, 200, 0, 255);
+      SDL_RenderFillRect(g_ren, &dst);
+    }
+    return;
+  }
 
   if (tile == T_QUESTION && g_texQuestion) {
+    drawBlockShadow();
     int frame = ((SDL_GetTicks() / 200) % 3);
     SDL_Rect src = {frame * 16, questionRowForTheme(g_theme), 16, 16};
     SDL_RenderCopy(g_ren, g_texQuestion, &src, &dst);
     return;
   }
   if (tile == T_USED && g_texQuestion) {
-    SDL_Rect src = {0, questionRowForTheme(g_theme), 16, 16};
-    SDL_SetTextureColorMod(g_texQuestion, 200, 140, 60);
+    drawBlockShadow();
+    // Use the dedicated "used" tile (check-mark) in the QuestionBlock sheet.
+    SDL_Rect src = {2 * 16, questionRowForTheme(g_theme), 16, 16};
     SDL_RenderCopy(g_ren, g_texQuestion, &src, &dst);
-    SDL_SetTextureColorMod(g_texQuestion, 255, 255, 255);
-    SDL_SetRenderDrawColor(g_ren, 150, 90, 30, 255);
-    SDL_Rect inner = {dst.x + 4, dst.y + 4, 8, 8};
-    SDL_RenderFillRect(g_ren, &inner);
     return;
   }
 
   // If a terrain atlas is available, prefer it for tiles coming from the
   // Godot TileMap so we preserve proper edges, gaps, and pipe pieces.
-  if (g_texTerrain && g_levelInfo.atlasX && g_levelInfo.atlasY) {
+  if (g_levelInfo.atlasX && g_levelInfo.atlasY) {
     uint8_t ax = g_levelInfo.atlasX[ty][tx];
     uint8_t ay = g_levelInfo.atlasY[ty][tx];
     if (ax != 255 && ay != 255) {
       SDL_Rect src = {ax * 16, ay * 16, 16, 16};
-      SDL_RenderCopy(g_ren, g_texTerrain, &src, &dst);
+      SDL_Texture *atlasTex = g_texTerrain;
+      uint8_t at = g_levelInfo.atlasT ? g_levelInfo.atlasT[ty][tx] : ATLAS_TERRAIN;
+      if (at == ATLAS_DECO)
+        atlasTex = g_texDeco ? g_texDeco : g_texTerrain;
+      else if (at == ATLAS_LIQUID)
+        atlasTex = g_texLiquids ? g_texLiquids : g_texTerrain;
+      if (atlasTex)
+        SDL_RenderCopy(g_ren, atlasTex, &src, &dst);
       return;
     }
+
+    // Collision-only markers: the level generator may stamp T_PIPE tiles
+    // (without atlas coords) for PipeArea safety; don't render these.
+    if (tile == T_PIPE)
+      return;
   }
 
   // Fallback simple tiles
@@ -1569,18 +2555,24 @@ void drawTile(int tx, int ty, uint8_t tile) {
       src = {0, 0, 16, 16};
       break;
     case T_BRICK:
+      drawBlockShadow();
       src = {0, 64, 16, 16};
       break;
     case T_USED:
       src = {0, 64, 16, 16};
       break;
     case T_PIPE: {
-      bool top = (ty == 0 || g_map[ty - 1][tx] != T_PIPE);
-      src = top ? SDL_Rect{240, 0, 16, 16} : SDL_Rect{240, 16, 16, 16};
+      // If we don't have atlas coordinates for a pipe tile, prefer the solid
+      // color fallback below. The fixed atlas coords here only cover a subset
+      // of pipe pieces and can create repeating/incorrect visuals.
+      use = false;
       break;
     }
     case T_CASTLE:
       src = {0, 176, 16, 16};
+      break;
+    case T_COIN:
+      use = false;
       break;
     default:
       use = false;
@@ -1615,6 +2607,9 @@ void drawTile(int tx, int ty, uint8_t tile) {
   case T_CASTLE:
     SDL_SetRenderDrawColor(g_ren, 100, 100, 100, 255);
     break;
+  case T_COIN:
+    SDL_SetRenderDrawColor(g_ren, 255, 200, 0, 255);
+    break;
   default:
     return;
   }
@@ -1622,91 +2617,199 @@ void drawTile(int tx, int ty, uint8_t tile) {
 
 }
 
+static bool computeCastleDst(SDL_Rect &outDst) {
+  if (!g_texCastle)
+    return false;
+  int minX = mapWidth();
+  int maxY = -1;
+  for (int y = 0; y < MAP_H; y++) {
+    for (int x = 0; x < mapWidth(); x++) {
+      if (g_map[y][x] == T_CASTLE) {
+        if (x < minX)
+          minX = x;
+        if (y > maxY)
+          maxY = y;
+      }
+    }
+  }
+  if (maxY < 0 || minX >= mapWidth())
+    return false;
+  int texW = 0, texH = 0;
+  SDL_QueryTexture(g_texCastle, nullptr, nullptr, &texW, &texH);
+  int baseY = (maxY + 1) * TILE - texH;
+  outDst = {minX * TILE - (int)g_camX, baseY, texW, texH};
+  return true;
+}
+
 void render() {
   if (g_state == GS_TITLE) {
-    SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
+    // Sky backdrop.
+    SDL_SetRenderDrawColor(g_ren, 92, 148, 252, 255);
     SDL_RenderClear(g_ren);
 
-    if (g_texMenuBG) {
-      SDL_Rect bg = {0, 0, GAME_W, GAME_H};
-      SDL_RenderCopy(g_ren, g_texMenuBG, nullptr, &bg);
-    } else {
-      SDL_SetRenderDrawColor(g_ren, 10, 10, 20, 255);
-      SDL_RenderClear(g_ren);
-    }
-
-    if (g_texTitle) {
-      int w = 192, h = 64;
-      SDL_Rect dst = {(GAME_W - w) / 2, 12, w, h};
-      SDL_RenderCopy(g_ren, g_texTitle, nullptr, &dst);
-    }
-
-    SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 180);
-    SDL_Rect panel = {20, 80, GAME_W - 40, 110};
-    SDL_RenderFillRect(g_ren, &panel);
-    SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
-    SDL_RenderDrawRect(g_ren, &panel);
-
-    const char *selText = "SELECT CHARACTER";
-    drawText((GAME_W - textWidth(selText, 2)) / 2 + 1, 86, selText, 2,
-             {0, 0, 0, 255});
-    drawText((GAME_W - textWidth(selText, 2)) / 2, 84, selText, 2,
-             {255, 255, 255, 255});
-
-    const int startX = (GAME_W - (g_charCount * 56 - 16)) / 2;
-    const int y = GAME_H / 2 + 5;
-    for (int i = 0; i < g_charCount; i++) {
-      int x = startX + i * 56;
-      int iconW = PLAYER_DRAW_W_SMALL * 2;
-      int iconH = 16 * 2;
-      SDL_Rect dst = {x + (24 - iconW) / 2, y + (24 - iconH) / 2, iconW,
-                      iconH};
-      SDL_Rect src = {0, 0, 16, 16};
-      if (g_texPlayerSmall[i])
-        SDL_RenderCopy(g_ren, g_texPlayerSmall[i], &src, &dst);
-
-      SDL_Rect box = {x - 6, y - 6, 36, 36};
-      SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
-      if (i == g_menuIndex) {
-        SDL_RenderDrawRect(g_ren, &box);
-        SDL_Rect inner = {box.x + 2, box.y + 2, box.w - 4, box.h - 4};
-        SDL_RenderDrawRect(g_ren, &inner);
+    // Decorative background layers.
+    {
+      if (g_texBgSky) {
+        SDL_Rect src = {0, 0, 512, 240};
+        SDL_Rect dst = {0, 0, 512, GAME_H};
+        for (int x = dst.x; x < GAME_W; x += 512) {
+          SDL_Rect d = {x, dst.y, dst.w, dst.h};
+          SDL_RenderCopy(g_ren, g_texBgSky, &src, &d);
+        }
+      }
+      int y = GAME_H - 64;
+      if (g_texBgHills) {
+        SDL_Rect src = {0, 512 - 96, 512, 96};
+        SDL_Rect dst = {0, y - 32, 512, 96};
+        for (int x = dst.x; x < GAME_W; x += 512) {
+          SDL_Rect d = {x, dst.y, dst.w, dst.h};
+          SDL_RenderCopy(g_ren, g_texBgHills, &src, &d);
+        }
+      }
+      if (g_texBgBushes) {
+        SDL_Rect src = {0, 512 - 64, 512, 64};
+        SDL_Rect dst = {0, y, 512, 64};
+        for (int x = dst.x; x < GAME_W; x += 512) {
+          SDL_Rect d = {x, dst.y, dst.w, dst.h};
+          SDL_RenderCopy(g_ren, g_texBgBushes, &src, &d);
+        }
+      }
+      if (g_texBgCloudOverlay) {
+        SDL_SetTextureAlphaMod(g_texBgCloudOverlay, 200);
+        SDL_Rect src = {0, 0, 512, 512};
+        SDL_Rect dst = {0, -40, 512, 512};
+        for (int x = dst.x; x < GAME_W; x += 512) {
+          SDL_Rect d = {x, dst.y, dst.w, dst.h};
+          SDL_RenderCopy(g_ren, g_texBgCloudOverlay, &src, &d);
+        }
+        SDL_SetTextureAlphaMod(g_texBgCloudOverlay, 255);
       }
     }
 
-    drawText((GAME_W - textWidth(g_charDisplayNames[g_menuIndex], 2)) / 2, y + 30,
-             g_charDisplayNames[g_menuIndex], 2, {255, 255, 255, 255});
+    // Ground strip.
+    {
+      int groundY = GAME_H - 32;
+      SDL_Rect src = {0, 0, 16, 16};
+      for (int row = 0; row < 2; row++) {
+        for (int x = 0; x < GAME_W + 16; x += 16) {
+          SDL_Rect dst = {x, groundY + row * 16, 16, 16};
+          if (g_texTerrain)
+            SDL_RenderCopy(g_ren, g_texTerrain, &src, &dst);
+          else {
+            SDL_SetRenderDrawColor(g_ren, 200, 76, 12, 255);
+            SDL_RenderFillRect(g_ren, &dst);
+          }
+        }
+      }
+    }
 
-    const char *pressText = "PRESS A";
-    drawText((GAME_W - textWidth(pressText, 2)) / 2 + 1, y + 50, pressText, 2,
-             {0, 0, 0, 255});
-    drawText((GAME_W - textWidth(pressText, 2)) / 2, y + 48, pressText, 2,
-             {255, 255, 0, 255});
+    // Title banner.
+    // Title2.png is a 3x7 grid of 176x40 "REMSTERED" variants; render one cell.
+    if (g_texTitle) {
+      SDL_Rect src = {0, 0, 176, 40};
+      int w = 320;
+      int h = (w * src.h) / src.w;
+      SDL_Rect dst = {(GAME_W - w) / 2, 18, w, h};
+      SDL_RenderCopy(g_ren, g_texTitle, &src, &dst);
+    }
 
-    const char *optsHint = "Y OPTIONS";
-    drawText((GAME_W - textWidth(optsHint, 1)) / 2, y + 68, optsHint, 1,
-             {200, 200, 200, 255});
-
-    if (g_titleMode == TITLE_OPTIONS) {
+    if (g_titleMode == TITLE_MAIN) {
+      const char *items[] = {"PLAY GAME", "SETTINGS", "EXTRAS"};
+      constexpr int itemCount = 3;
+      int baseY = 180;
+      for (int i = 0; i < itemCount; i++) {
+        SDL_Color c = (i == g_mainMenuIndex) ? SDL_Color{255, 255, 0, 255}
+                                             : SDL_Color{255, 255, 255, 255};
+        int x = (GAME_W - textWidth(items[i], 2)) / 2;
+        int y = baseY + i * 20;
+        drawTextShadow(x, y, items[i], 2, c);
+        if (i == g_mainMenuIndex && g_texMushroom) {
+          SDL_Rect src = {0, 0, 16, 16};
+          SDL_Rect dst = {x - 26, y + 2, 16, 16};
+          SDL_RenderCopy(g_ren, g_texMushroom, &src, &dst);
+        }
+      }
+      drawTextShadow(8, GAME_H - 18, "V1.0.1", 1, {255, 255, 255, 255});
+    } else if (g_titleMode == TITLE_CHAR_SELECT) {
       SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-      SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 200);
-      SDL_Rect oPanel = {40, 30, GAME_W - 80, 120};
+      SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 170);
+      SDL_Rect panel = {24, 82, GAME_W - 48, 108};
+      SDL_RenderFillRect(g_ren, &panel);
+      SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
+      SDL_RenderDrawRect(g_ren, &panel);
+
+      const char *selText = "SELECT CHARACTER";
+      drawTextShadow((GAME_W - textWidth(selText, 2)) / 2, 90, selText, 2,
+                     {255, 255, 255, 255});
+
+      const int startX = (GAME_W - (g_charCount * 56 - 16)) / 2;
+      const int y = 124;
+      for (int i = 0; i < g_charCount; i++) {
+        int x = startX + i * 56;
+        int iconW = PLAYER_DRAW_W_SMALL * 2;
+        int iconH = 16 * 2;
+        SDL_Rect dst = {x + (24 - iconW) / 2, y + (24 - iconH) / 2, iconW,
+                        iconH};
+        SDL_Rect src = {0, 0, 16, 16};
+        if (g_texPlayerSmall[i])
+          SDL_RenderCopy(g_ren, g_texPlayerSmall[i], &src, &dst);
+
+        SDL_Rect box = {x - 6, y - 6, 36, 36};
+        SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
+        if (i == g_menuIndex) {
+          SDL_RenderDrawRect(g_ren, &box);
+          SDL_Rect inner = {box.x + 2, box.y + 2, box.w - 4, box.h - 4};
+          SDL_RenderDrawRect(g_ren, &inner);
+        }
+      }
+
+      drawTextShadow(
+          (GAME_W - textWidth(g_charDisplayNames[g_menuIndex], 2)) / 2, y + 34,
+          g_charDisplayNames[g_menuIndex], 2, {255, 255, 255, 255});
+      drawTextShadow((GAME_W - textWidth("PRESS A", 2)) / 2, y + 54, "PRESS A",
+                     2, {255, 255, 0, 255});
+      drawTextShadow((GAME_W - textWidth("B BACK", 1)) / 2, y + 74, "B BACK", 1,
+                     {220, 220, 220, 255});
+      drawTextShadow((GAME_W - textWidth("Y OPTIONS", 1)) / 2, y + 86,
+                     "Y OPTIONS", 1, {220, 220, 220, 255});
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+    } else if (g_titleMode == TITLE_OPTIONS) {
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+      SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 190);
+      SDL_Rect oPanel = {52, 58, GAME_W - 104, 130};
       SDL_RenderFillRect(g_ren, &oPanel);
       SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
       SDL_RenderDrawRect(g_ren, &oPanel);
 
-      const char *title = "OPTIONS";
-      drawText((GAME_W - textWidth(title, 2)) / 2, 38, title, 2,
-               {255, 255, 255, 255});
+      const char *title = "SETTINGS";
+      drawTextShadow((GAME_W - textWidth(title, 2)) / 2, 66, title, 2,
+                     {255, 255, 255, 255});
 
-      const char *line1 = g_randomTheme ? "RANDOM THEME: ON" : "RANDOM THEME: OFF";
+      const char *line1 =
+          g_randomTheme ? "RANDOM THEME: ON" : "RANDOM THEME: OFF";
       const char *line2 = g_nightMode ? "NIGHT MODE: ON" : "NIGHT MODE: OFF";
-      int baseY = 70;
+      int baseY = 98;
       SDL_Color hi = {255, 255, 0, 255};
       SDL_Color norm = {255, 255, 255, 255};
-      drawText(60, baseY, line1, 1, g_optionsIndex == 0 ? hi : norm);
-      drawText(60, baseY + 16, line2, 1, g_optionsIndex == 1 ? hi : norm);
-      drawText(60, baseY + 40, "B BACK", 1, {200, 200, 200, 255});
+      drawTextShadow(70, baseY, line1, 1, g_optionsIndex == 0 ? hi : norm);
+      drawTextShadow(70, baseY + 16, line2, 1,
+                     g_optionsIndex == 1 ? hi : norm);
+      drawTextShadow(70, baseY + 44, "B BACK", 1, {220, 220, 220, 255});
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+    } else if (g_titleMode == TITLE_EXTRAS) {
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+      SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 190);
+      SDL_Rect ePanel = {52, 70, GAME_W - 104, 110};
+      SDL_RenderFillRect(g_ren, &ePanel);
+      SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
+      SDL_RenderDrawRect(g_ren, &ePanel);
+      drawTextShadow((GAME_W - textWidth("EXTRAS", 2)) / 2, 78, "EXTRAS", 2,
+                     {255, 255, 255, 255});
+      drawTextShadow((GAME_W - textWidth("COMING SOON", 2)) / 2, 114,
+                     "COMING SOON", 2, {255, 255, 255, 255});
+      drawTextShadow((GAME_W - textWidth("B BACK", 1)) / 2, 150, "B BACK", 1,
+                     {220, 220, 220, 255});
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
     }
 
     SDL_RenderPresent(g_ren);
@@ -1727,79 +2830,164 @@ void render() {
   }
   SDL_RenderClear(g_ren);
 
-  // Tiles
-  int startTx = (int)(g_camX / TILE) - 1;
-  int viewTiles = (GAME_W + TILE - 1) / TILE + 2;
-  for (int ty = 0; ty < MAP_H; ty++) {
-    for (int tx = startTx; tx < startTx + viewTiles && tx < mapWidth(); tx++) {
-      if (tx >= 0)
+  // Background layers (decorative only).
+  {
+    if (g_texBgSky) {
+      SDL_Rect src = {0, 0, 512, 240};
+      SDL_Rect dst = {-(int)(g_camX * 0.03f) % 512, 0, 512, GAME_H};
+      for (int x = dst.x; x < GAME_W; x += 512) {
+        SDL_Rect d = {x, dst.y, dst.w, dst.h};
+        SDL_RenderCopy(g_ren, g_texBgSky, &src, &d);
+      }
+    }
+
+    int primary = g_levelInfo.bgPrimary;
+	    if (primary == 3) {
+	      primary = 0;
+	      if ((g_theme == THEME_JUNGLE || g_theme == THEME_AUTUMN) &&
+	          ((g_levelInfo.world > 4 && g_levelInfo.world <= 8) || g_nightMode)) {
+	        primary = 1;
+	      }
+	    }
+	    // Some overworld sections in the source project mark the primary BG as
+	    // "None", but SMB1-style stages look better with hills+bushes by default.
+	    if (primary == 2 && g_theme == THEME_OVERWORLD)
+	      primary = 0;
+
+    // Match the general SMB1 feel: for "Hills" levels, draw both hills and
+    // bushes; for "Bush" levels, draw bushes only. If a section specifies
+    // "None", keep the background empty (except optional sky).
+    if (primary == 0 && g_texBgHills) {
+      // Draw the full texture anchored to the bottom so we don't accidentally
+      // crop off tall/variable assets (e.g. overworld hills).
+      SDL_Rect src = {0, 0, 512, 512};
+      SDL_Rect dst = {-(int)(g_camX * 0.10f) % 512, GAME_H - 512, 512, 512};
+      for (int x = dst.x; x < GAME_W; x += 512) {
+        SDL_Rect d = {x, dst.y, dst.w, dst.h};
+        SDL_RenderCopy(g_ren, g_texBgHills, &src, &d);
+      }
+    }
+
+    if ((primary == 0 || primary == 1) && g_texBgBushes) {
+      SDL_Rect src = {0, 0, 512, 512};
+      SDL_Rect dst = {-(int)(g_camX * 0.18f) % 512, GAME_H - 512, 512, 512};
+      for (int x = dst.x; x < GAME_W; x += 512) {
+        SDL_Rect d = {x, dst.y, dst.w, dst.h};
+        SDL_RenderCopy(g_ren, g_texBgBushes, &src, &d);
+      }
+    }
+
+    // Secondary layer (trees/mushrooms) sits in front of the primary background
+    // but still behind gameplay tiles/entities.
+    int secondary = g_levelInfo.bgSecondary;
+    if (secondary == 0 && g_theme == THEME_OVERWORLD) {
+      // Default the classic SMB1 overworld tree layer on, even if the source
+      // section doesn't explicitly request it.
+      secondary = 2;
+    }
+    if (secondary > 0 && g_texBgSecondary) {
+      SDL_Rect src = {0, 0, 512, 512};
+      SDL_Rect dst = {-(int)(g_camX * 0.32f) % 512, GAME_H - 512, 512, 512};
+      for (int x = dst.x; x < GAME_W; x += 512) {
+        SDL_Rect d = {x, dst.y, dst.w, dst.h};
+        SDL_RenderCopy(g_ren, g_texBgSecondary, &src, &d);
+      }
+    }
+
+    // Clouds are subtle and look good on most outdoor levels; default them on
+    // for overworld even if the source section doesn't request them.
+    bool wantsClouds = g_levelInfo.bgClouds || (g_theme == THEME_OVERWORLD);
+    if (wantsClouds && g_texBgCloudOverlay) {
+      SDL_SetTextureAlphaMod(g_texBgCloudOverlay, 200);
+      SDL_Rect src = {0, 0, 512, 512};
+      SDL_Rect dst = {-(int)(g_camX * 0.06f) % 512, -40, 512, 512};
+      for (int x = dst.x; x < GAME_W; x += 512) {
+        SDL_Rect d = {x, dst.y, dst.w, dst.h};
+        SDL_RenderCopy(g_ren, g_texBgCloudOverlay, &src, &d);
+      }
+      SDL_SetTextureAlphaMod(g_texBgCloudOverlay, 255);
+    }
+	  }
+
+	  // Foreground decorations (still behind the player). Draw these *before*
+	  // gameplay tiles so pipes/blocks correctly occlude them.
+	  if (g_texDeco && g_fgDecoCount > 0) {
+	    for (int i = 0; i < g_fgDecoCount; i++) {
+	      const ForegroundDeco &d = g_fgDecos[i];
+	      int baseX = d.tx * TILE - (int)g_camX;
+	      if (baseX < -(int)(d.w * TILE) || baseX > GAME_W)
+	        continue;
+	      for (int c = 0; c < d.cellCount; c++) {
+	        const auto &cell = d.cells[c];
+	        SDL_Rect src = {(int)cell.ax * 16, (int)cell.ay * 16, 16, 16};
+	        SDL_Rect dst = {baseX + cell.dx * TILE, (d.ty + cell.dy) * TILE, 16,
+	                        16};
+	        SDL_RenderCopy(g_ren, g_texDeco, &src, &dst);
+	      }
+	    }
+	  }
+
+	  // Tiles
+	  int startTx = (int)(g_camX / TILE) - 1;
+	  int viewTiles = (GAME_W + TILE - 1) / TILE + 2;
+	  auto isDecoTile = [&](int tx, int ty) -> bool {
+    if (!g_levelInfo.atlasT || !g_levelInfo.atlasX || !g_levelInfo.atlasY)
+      return false;
+    if (g_levelInfo.atlasX[ty][tx] == 255 || g_levelInfo.atlasY[ty][tx] == 255)
+      return false;
+    return g_levelInfo.atlasT[ty][tx] == ATLAS_DECO;
+  };
+  // Draw decorations first (background), then gameplay terrain/blocks.
+  for (int pass = 0; pass < 2; pass++) {
+    bool decoPass = (pass == 0);
+    for (int ty = 0; ty < MAP_H; ty++) {
+      for (int tx = startTx; tx < startTx + viewTiles && tx < mapWidth(); tx++) {
+        if (tx < 0)
+          continue;
+        bool deco = isDecoTile(tx, ty);
+        if (decoPass != deco)
+          continue;
         drawTile(tx, ty, g_map[ty][tx]);
-    }
-  }
+      }
+	    }
+	  }
 
-    // Flagpole + flag
-    if (g_hasFlag) {
-      int groundY = MAP_H - 1;
-      for (int y = MAP_H - 1; y >= 0; y--) {
-        if (solidAt(g_flagX, y) || solidAt(g_flagX + 1, y)) {
-          groundY = y;
-          break;
-        }
-      }
-      int poleX = g_flagX * TILE - (int)g_camX + 8;
-      int poleBottom = (groundY + 1) * TILE;
+	    // Flagpole + flag
+	    if (g_hasFlag) {
+	      int groundY = MAP_H - 1;
+	      for (int y = MAP_H - 1; y >= 0; y--) {
+	        if (solidAt(g_flagX, y) || solidAt(g_flagX + 1, y)) {
+	          groundY = y;
+	          break;
+	        }
+	      }
+	      int poleX = g_flagX * TILE - (int)g_camX;
+	      int poleBottom = (groundY + 1) * TILE;
 
-      if (g_texFlagPole) {
-        int texW = 0, texH = 0;
-        SDL_QueryTexture(g_texFlagPole, nullptr, nullptr, &texW, &texH);
-        SDL_Rect src = {0, 0, 16, texH};
-        SDL_Rect dst = {poleX - 8, poleBottom - texH, 16, texH};
-        SDL_RenderCopy(g_ren, g_texFlagPole, &src, &dst);
-      }
-      if (g_texFlag) {
-        int frame = ((SDL_GetTicks() / 150) % 3);
-        SDL_Rect src = {frame * 16, 0, 16, 16};
-        SDL_Rect dst = {poleX - 18, (int)g_flagY, 16, 16};
-        SDL_RenderCopy(g_ren, g_texFlag, &src, &dst);
-      }
-    }
+	      if (g_texFlagPole) {
+	        int texW = 0, texH = 0;
+	        SDL_QueryTexture(g_texFlagPole, nullptr, nullptr, &texW, &texH);
+	        SDL_Rect src = {0, 0, 16, texH};
+	        SDL_Rect dst = {poleX, poleBottom - texH, 16, texH};
+	        SDL_RenderCopy(g_ren, g_texFlagPole, &src, &dst);
+	      }
+	      if (g_texFlag) {
+	        int frame = ((SDL_GetTicks() / 150) % 3);
+	        SDL_Rect src = {frame * 16, 0, 16, 16};
+	        SDL_Rect dst = {poleX - 16, (int)g_flagY, 16, 16};
+	        SDL_RenderCopy(g_ren, g_texFlag, &src, &dst);
+	      }
+	    }
 
-    // Castle
-    if (g_texCastle) {
-      int minX = MAP_W;
-      int maxY = -1;
-      for (int y = 0; y < MAP_H; y++) {
-        for (int x = 0; x < mapWidth(); x++) {
-          if (g_map[y][x] == T_CASTLE) {
-            if (x < minX)
-              minX = x;
-            if (y > maxY)
-              maxY = y;
-          }
-        }
-      }
-      if (maxY >= 0) {
-        int groundY = maxY;
-        for (int y = MAP_H - 1; y >= 0; y--) {
-          bool found = false;
-          for (int x = minX; x < minX + 5; x++) {
-            if (solidAt(x, y)) {
-              groundY = y;
-              found = true;
-              break;
-            }
-          }
-          if (found)
-            break;
-        }
-        int texW = 0, texH = 0;
-        SDL_QueryTexture(g_texCastle, nullptr, nullptr, &texW, &texH);
-        SDL_Rect src = {0, 0, texW, texH};
-        SDL_Rect dst = {minX * TILE - (int)g_camX, (groundY + 1) * TILE - texH,
-                        texW, texH};
-        SDL_RenderCopy(g_ren, g_texCastle, &src, &dst);
-      }
-    }
+	    // Castle
+	    g_castleDrawOn = computeCastleDst(g_castleDrawDst);
+	    if (g_castleDrawOn) {
+	      int topH = (g_castleDrawDst.h > 120) ? 120 : g_castleDrawDst.h;
+	      SDL_Rect srcTop = {0, 0, g_castleDrawDst.w, topH};
+	      SDL_Rect dstTop = g_castleDrawDst;
+	      dstTop.h = topH;
+	      SDL_RenderCopy(g_ren, g_texCastle, &srcTop, &dstTop);
+	    }
 
     // Entities
     for (int i = 0; i < 64; i++) {
@@ -1864,13 +3052,13 @@ void render() {
           SDL_SetRenderDrawColor(g_ren, 220, 140, 40, 255);
           SDL_RenderFillRect(g_ren, &dst);
         }
-      } else if (e.type == E_FIREBALL) {
-        if (g_texFireball) {
-          SDL_Rect src = {0, 0, 8, 8};
-          SDL_RenderCopy(g_ren, g_texFireball, &src, &dst);
-        } else {
-          SDL_SetRenderDrawColor(g_ren, 255, 120, 40, 255);
-          SDL_RenderFillRect(g_ren, &dst);
+	      } else if (e.type == E_FIREBALL) {
+	        if (g_texFireball) {
+	          SDL_Rect src = {0, 0, 16, 16};
+	          SDL_RenderCopy(g_ren, g_texFireball, &src, &dst);
+	        } else {
+	          SDL_SetRenderDrawColor(g_ren, 255, 120, 40, 255);
+	          SDL_RenderFillRect(g_ren, &dst);
         }
       } else if (e.type == E_COIN_POPUP) {
         if (g_texCoin) {
@@ -1888,22 +3076,15 @@ void render() {
     bool showPlayer = (g_p.invT <= 0 || ((int)(g_p.animT * 8) % 2) == 0);
     if (!g_p.dead && showPlayer) {
       int px = (int)(g_p.r.x - g_camX);
-      int pw = (g_p.power == P_SMALL) ? PLAYER_DRAW_W_SMALL : PLAYER_DRAW_W_BIG;
-      int ph = (g_p.power == P_SMALL) ? 16 : 32;
-      int drawW = pw;
-      int drawH = ph;
-      int drawX = px + (int)((g_p.r.w - drawW) / 2);
-      int drawY = (int)g_p.r.y;
-      if (g_p.crouch && g_p.power == P_BIG)
-        drawY -= 16;
-      if (g_p.power == P_FIRE) {
-        // Fire sheets are 32x48 frames; preserve aspect ratio when scaling down
-        // to the standard 32px render height.
-        drawH = ph;
-        drawW = (int)lroundf(drawH * (32.0f / 48.0f));
-        drawX = px + (int)((g_p.r.w - drawW) / 2);
-      }
-      SDL_Rect dst = {drawX, drawY, drawW, drawH};
+	      int pw = (g_p.power == P_SMALL) ? PLAYER_DRAW_W_SMALL : PLAYER_DRAW_W_BIG;
+	      int ph = (g_p.power == P_SMALL) ? 16 : 32;
+	      int drawW = pw;
+	      int drawH = ph;
+	      int drawX = px + (int)((g_p.r.w - drawW) / 2);
+	      int drawY = (int)g_p.r.y;
+	      if (g_p.crouch && g_p.power >= P_BIG)
+	        drawY -= 16;
+	      SDL_Rect dst = {drawX, drawY, drawW, drawH};
 
       // Try to draw sprite texture on top (if it works, it will cover the
       // fallback)
@@ -1921,81 +3102,130 @@ void render() {
           Mix_PlayChannel(-1, g_sfxSkid, 0);
           g_skidCooldown = 0.35f;
         }
-        int frame = 0;
-        if (g_p.crouch && g_p.power >= P_BIG) {
-          frame = 1;
-        } else if (!g_p.ground) {
-          frame = 5;
-        } else {
-          frame = skidding ? 4
-                           : (fabsf(g_p.vx) > 10
-                                  ? 1 + ((int)(g_p.animT * 10) % 3)
-                                  : 0);
-        }
-        SDL_Rect src = {0, 0, 16, 16};
-        if (g_p.power == P_FIRE) {
-          int fireFrame = 0;
-          if (g_p.crouch)
-            fireFrame = 1;
-          else if (!g_p.ground)
-            fireFrame = 6;
-          else if (skidding)
-            fireFrame = 5;
-          else if (fabsf(g_p.vx) > 10)
-            fireFrame = 2 + ((int)(g_p.animT * 10) % 3);
-          else
-            fireFrame = 0;
-          src = firePlayerSrcForFrame(fireFrame);
-        } else {
-          int srcH = (g_p.power == P_SMALL) ? 16 : 32;
-          src = {frame * 16, 0, 16, srcH};
-        }
+	        int frame = 0;
+	        SDL_Rect src = {0, 0, 16, 16};
+	        if (g_p.power == P_SMALL) {
+	          if (!g_p.ground) {
+	            frame = 5;
+	          } else {
+	            frame = skidding ? 4
+	                             : (fabsf(g_p.vx) > 10
+	                                    ? 1 + ((int)(g_p.animT * 10) % 3)
+	                                    : 0);
+	          }
+	          src = {frame * 16, 0, 16, 16};
+	        } else if (g_p.power == P_FIRE) {
+	          int fireFrame = 0;
+	          if (g_p.throwT > 0.0f) {
+	            fireFrame = g_p.ground ? 7 : 8;
+	          } else if (g_p.crouch && g_p.ground) {
+	            fireFrame = 1;
+	          } else if (!g_p.ground) {
+	            fireFrame = 6;
+	          } else if (skidding) {
+	            fireFrame = 5;
+	          } else if (fabsf(g_p.vx) > 10) {
+	            fireFrame = 2 + ((int)(g_p.animT * 10) % 3);
+	          } else {
+	            fireFrame = 0;
+	          }
+	          src = firePlayerSrcForFrame(fireFrame);
+	        } else {
+	          // Big sheet: 0 idle, 1 crouch, 2..4 walk, 5 skid, 6 jump
+	          if (g_p.crouch && g_p.ground) {
+	            frame = 1;
+	          } else if (!g_p.ground) {
+	            frame = 6;
+	          } else {
+	            frame = skidding ? 5
+	                             : (fabsf(g_p.vx) > 10
+	                                    ? 2 + ((int)(g_p.animT * 10) % 3)
+	                                    : 0);
+	          }
+	          src = {frame * 16, 0, 16, 32};
+	        }
+
         SDL_RendererFlip flip = g_p.right ? SDL_FLIP_NONE : SDL_FLIP_HORIZONTAL;
-        SDL_RenderCopyEx(g_ren, tex, &src, &dst, 0, nullptr, flip);
-      } else {
-        // Fallback rectangle if texture missing
-        SDL_SetRenderDrawColor(g_ren, 228, 52, 52, 255);
-        SDL_RenderFillRect(g_ren, &dst);
-      }
-    }
-  if (g_nightMode) {
-    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(g_ren, 0, 0, 40, 100);
-    SDL_Rect night = {0, 0, GAME_W, GAME_H};
+	        SDL_RenderCopyEx(g_ren, tex, &src, &dst, 0, nullptr, flip);
+	      } else {
+	        // Fallback rectangle if texture missing
+	        SDL_SetRenderDrawColor(g_ren, 228, 52, 52, 255);
+	        SDL_RenderFillRect(g_ren, &dst);
+	      }
+	    }
+	    // Castle overlay: hides the player as they enter the door.
+	    if (g_castleDrawOn && g_texCastle && g_castleDrawDst.h > 120) {
+	      int overlayY = 120;
+	      int overlayH = g_castleDrawDst.h - overlayY;
+	      SDL_Rect src = {0, overlayY, g_castleDrawDst.w, overlayH};
+	      SDL_Rect dst = {g_castleDrawDst.x, g_castleDrawDst.y + overlayY,
+	                      g_castleDrawDst.w, overlayH};
+	      SDL_RenderCopy(g_ren, g_texCastle, &src, &dst);
+	    }
+	  if (g_nightMode) {
+	    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+	    SDL_SetRenderDrawColor(g_ren, 0, 0, 40, 100);
+	    SDL_Rect night = {0, 0, GAME_W, GAME_H};
     SDL_RenderFillRect(g_ren, &night);
   }
-  // HUD
-  SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 200);
-  SDL_Rect hudBg = {0, 0, GAME_W, 24};
-  SDL_RenderFillRect(g_ren, &hudBg);
+  // HUD (SMB-style, drawn directly on the sky)
+  {
+    SDL_Color white = {255, 255, 255, 255};
+    SDL_Color yellow = {255, 255, 0, 255};
+    char buf[64];
+    int scale = 1;
+    int y1 = 6;
+    int y2 = 16;
+    int margin = 8;
 
-  char buf[64];
-  // Score
-  snprintf(buf, sizeof(buf), "SCORE %06d", g_p.score % 1000000);
-  drawText(6, 4, buf, 1, {255, 255, 255, 255});
-  // World-Level
-  snprintf(buf, sizeof(buf), "WORLD %d-%d", g_levelInfo.world,
-           g_levelInfo.stage);
-  drawText((GAME_W - textWidth(buf, 1)) / 2, 4, buf, 1,
-           {255, 255, 255, 255});
-  // Time
-  snprintf(buf, sizeof(buf), "TIME %03d", g_time < 0 ? 0 : g_time);
-  drawText(GAME_W - textWidth(buf, 1) - 6, 4, buf, 1,
-           {255, 255, 255, 255});
-  // Coins
-  snprintf(buf, sizeof(buf), "COIN %02d", g_p.coins % 100);
-  drawText(6, 14, buf, 1, {255, 255, 0, 255});
-  // Lives
-  snprintf(buf, sizeof(buf), "x%02d", g_p.lives);
-  int livesTextW = textWidth(buf, 1);
-  int iconSize = 8;
-  int iconX = GAME_W - 6 - livesTextW - 4 - iconSize;
-  int iconY = 14;
-  if (g_texLifeIcon[g_charIndex]) {
-    SDL_Rect lifeDst = {iconX, iconY, iconSize, iconSize};
-    SDL_RenderCopy(g_ren, g_texLifeIcon[g_charIndex], nullptr, &lifeDst);
+    // Player + score (left)
+    drawTextShadow(margin, y1, g_charDisplayNames[g_charIndex], scale, white);
+    snprintf(buf, sizeof(buf), "%06d", g_p.score % 1000000);
+    drawTextShadow(margin, y2, buf, scale, white);
+
+	    // Coin count (upper middle-left)
+	    int coinX = margin + 110;
+	    if (g_texCoinIcon) {
+	      SDL_Rect src = {0, 0, 8, 8};
+	      SDL_Rect dst = {coinX, y1 - 1, 12, 12};
+	      SDL_RenderCopy(g_ren, g_texCoinIcon, &src, &dst);
+	    }
+    snprintf(buf, sizeof(buf), "x%02d", g_p.coins % 100);
+    drawTextShadow(coinX + 14, y1, buf, scale, yellow);
+
+    // World (center)
+    const char *worldLabel = "WORLD";
+    snprintf(buf, sizeof(buf), "%d-%d", g_levelInfo.world, g_levelInfo.stage);
+    int worldX = (GAME_W - textWidth(worldLabel, scale)) / 2;
+    drawTextShadow(worldX, y1, worldLabel, scale, white);
+    int worldValX = (GAME_W - textWidth(buf, scale)) / 2;
+    drawTextShadow(worldValX, y2, buf, scale, white);
+
+    // Time (upper right)
+    const char *timeLabel = "TIME";
+    snprintf(buf, sizeof(buf), "%03d", g_time < 0 ? 0 : g_time);
+
+    // Reserve space for lives icon+count at the far right.
+    char livesBuf[16];
+    snprintf(livesBuf, sizeof(livesBuf), "%02d", g_p.lives);
+    int lifeSize = 12;
+    int livesW = textWidth(livesBuf, scale);
+    int livesBlockW = lifeSize + 2 + livesW;
+
+    int timeRight = GAME_W - margin - livesBlockW - 10;
+    drawTextShadow(timeRight - textWidth(timeLabel, scale), y1, timeLabel, scale,
+                   white);
+    drawTextShadow(timeRight - textWidth(buf, scale), y2, buf, scale, white);
+
+    // Lives (below time, far right)
+    int iconX = GAME_W - margin - livesBlockW;
+    int iconY = y2 - 1;
+    if (g_texLifeIcon[g_charIndex]) {
+      SDL_Rect dst = {iconX, iconY, lifeSize, lifeSize};
+      SDL_RenderCopy(g_ren, g_texLifeIcon[g_charIndex], nullptr, &dst);
+    }
+    drawTextShadow(iconX + lifeSize + 2, y2, livesBuf, scale, white);
   }
-  drawText(iconX + iconSize + 4, 14, buf, 1, {255, 255, 255, 255});
 
   if (g_state == GS_DEAD || g_state == GS_GAMEOVER) {
     SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 200);
@@ -2008,20 +3238,29 @@ void render() {
     SDL_RenderFillRect(g_ren, &overlay);
   }
   if (g_state == GS_PAUSE) {
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 200);
-    SDL_Rect overlay = {GAME_W / 4 - 10, GAME_H / 3 - 10, GAME_W / 2 + 20, GAME_H / 3 + 20};
-    SDL_RenderFillRect(g_ren, &overlay);
-    drawText((GAME_W - textWidth("PAUSED", 2)) / 2, GAME_H / 2 - 8, "PAUSED",
-             2, {255, 255, 255, 255});
-    int menuY = GAME_H / 2 + 10;
+    SDL_Rect panel = {GAME_W / 2 - 140, GAME_H / 2 - 70, 280, 140};
+    SDL_RenderFillRect(g_ren, &panel);
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
+    SDL_RenderDrawRect(g_ren, &panel);
+
+    const char *title = "PAUSED";
+    int titleY = panel.y + 16;
+    drawTextShadow((GAME_W - textWidth(title, 2)) / 2, titleY, title, 2,
+                   {255, 255, 255, 255});
+
+    int menuY = titleY + 28;
     for (int i = 0; i < g_pauseOptionCount; i++) {
       SDL_Color c = (i == g_pauseIndex) ? SDL_Color{255, 255, 0, 255}
                                        : SDL_Color{255, 255, 255, 255};
-      drawText((GAME_W - textWidth(g_pauseOptions[i], 1)) / 2, menuY + i * 10,
-               g_pauseOptions[i], 1, c);
+      drawTextShadow((GAME_W - textWidth(g_pauseOptions[i], 1)) / 2,
+                     menuY + i * 14, g_pauseOptions[i], 1, c);
     }
-    drawText((GAME_W - textWidth("PRESS + TO RESUME", 1)) / 2, GAME_H - 18,
-             "PRESS + TO RESUME", 1, {200, 200, 200, 255});
+    drawTextShadow((GAME_W - textWidth("PRESS + TO RESUME", 1)) / 2,
+                   panel.y + panel.h - 16, "PRESS + TO RESUME", 1,
+                   {200, 200, 200, 255});
   }
 
   SDL_RenderPresent(g_ren);
@@ -2033,7 +3272,8 @@ int main(int argc, char **argv) {
   SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
   IMG_Init(IMG_INIT_PNG);
   Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 4096);
-  Mix_AllocateChannels(16);
+  Mix_AllocateChannels(32);
+  Mix_ReserveChannels(0);
 
   g_win = SDL_CreateWindow("SMB", 0, 0, TV_W, TV_H, SDL_WINDOW_FULLSCREEN);
   g_ren = SDL_CreateRenderer(
@@ -2042,12 +3282,15 @@ int main(int argc, char **argv) {
 
   loadAssets();
   g_state = GS_TITLE;
+  g_titleMode = TITLE_MAIN;
+  g_mainMenuIndex = 0;
   g_menuIndex = g_charIndex;
 
   Uint32 lastTick = SDL_GetTicks();
   while (WHBProcIsRunning()) {
-    float dt = (SDL_GetTicks() - lastTick) / 1000.0f;
-    lastTick = SDL_GetTicks();
+    Uint32 now = SDL_GetTicks();
+    float dt = (now - lastTick) / 1000.0f;
+    lastTick = now;
     if (dt > 0.1f)
       dt = 0.1f;
 

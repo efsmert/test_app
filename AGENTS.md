@@ -1090,4 +1090,40 @@ int main(int argc, char **argv) {
 
 ---
 
+## CRITICAL: Project-Specific Context
+
+**Before beginning any work on this codebase, the agent MUST read the `SUMMARY.md` file located in the project root.**
+
+This file contains:
+- Summaries of work completed by previous agents
+- Project-specific decisions and architectural choices
+- Current state of implementation
+- Known issues and their workarounds
+- Task history and progress tracking
+
+The `SUMMARY.md` file provides essential project context that supplements the general Wii U development knowledge in this document. Failing to read it may result in:
+- Duplicating work already completed
+- Contradicting established project conventions
+- Missing important context about why certain decisions were made
+- Breaking existing functionality
+
+**Always start by reading `SUMMARY.md` to understand the current project state before making any changes.**
+
+**Always use the following command to compile the project:**
+
+```set -euo pipefail
+python3 smb_wiiu/tools/godot_levels_to_cpp.py
+python3 smb_wiiu/extract_rom.py "Super Mario Bros. (Japan, USA).nes" smb_wiiu/content >/dev/null
+python3 smb_wiiu/extract_rom.py "Super Mario Bros. (Japan, USA).nes" smb_wiiu/content --tilesets-only >/dev/null
+rm -rf smb_wiiu/build
+export DEVKITPRO=/opt/devkitpro
+export DEVKITPPC=/opt/devkitpro/devkitPPC
+export PATH="$PATH:$DEVKITPRO/tools/bin:$DEVKITPPC/bin:$DEVKITPRO/portlibs/wiiu/bin"
+make -C smb_wiiu
+make -C smb_wiiu cemu-sync
+ls -la smb_wiiu/smb_wiiu_cemu/code/smb_wiiu.rpx
+```
+
+---
+
 *This document compiled from comprehensive Wii U homebrew development research for use by AI coding agents.*

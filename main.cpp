@@ -392,6 +392,15 @@ void resetGame() {
 // ============================================================================
 
 void processInput() {
+    // Default to "no input" so a dropped VPAD read doesn't leave stale buttons.
+    g_buttonAJustPressed = false;
+    g_buttonPlusJustPressed = false;
+    g_buttonAPressed = false;
+    g_buttonBPressed = false;
+    g_dpadLeft = false;
+    g_dpadRight = false;
+    g_leftStickX = 0.0f;
+
     VPADStatus vpad;
     VPADReadError error;
     

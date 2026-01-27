@@ -331,6 +331,16 @@ def extract_smb_assets(rom_path: Path, output_dir: Path) -> None:
     mushroom.save(output_dir / "sprites/items/SuperMushroom.png")
     print("Created: sprites/items/SuperMushroom.png")
 
+    # Fireball (render from ROM; the template asset is a green placeholder)
+    fireball_full = render_from_remastered_spec(
+        chr_rom,
+        rem / "Assets/Sprites/Items/Fireball.png",
+        rem / "Resources/AssetRipper/Sprites/Items/Fireball.json",
+    )
+    fireball = fireball_full.crop((0, 0, 16, 16))
+    fireball.save(output_dir / "sprites/items/Fireball.png")
+    print("Created: sprites/items/Fireball.png")
+
     # Question Block
     # Keep the full sheet so theme rows (Underground/Castle/Snow/etc) remain
     # available for rendering.
@@ -341,6 +351,15 @@ def extract_smb_assets(rom_path: Path, output_dir: Path) -> None:
     )
     question_full.save(output_dir / "sprites/blocks/QuestionBlock.png")
     print("Created: sprites/blocks/QuestionBlock.png")
+
+    # HUD coin icon (render from ROM; template contains placeholders)
+    coin_icon_full = render_from_remastered_spec(
+        chr_rom,
+        rem / "Assets/Sprites/UI/CoinIcon.png",
+        rem / "Resources/AssetRipper/Sprites/UI/CoinIcon.json",
+    )
+    coin_icon_full.save(output_dir / "sprites/ui/CoinIcon.png")
+    print("Created: sprites/ui/CoinIcon.png")
 
     build_character_sheets(output_dir)
     copy_ui_assets(output_dir)
@@ -407,20 +426,36 @@ def build_character_sheets(output_dir: Path) -> None:
     rem = remastered_root()
     chars = ["Mario", "Luigi", "Toad", "Toadette"]
 
-    mario_small_json = rem / "Assets/Sprites/Players/Mario/Small.json"
-    mario_big_json = rem / "Assets/Sprites/Players/Mario/Big.json"
+    def small_anim_order(json_path: Path) -> list[list[int]]:
+        # Small sheets: Idle, Move(3), Skid, Jump (6 frames)
+        order: list[list[int]] = []
+        order += load_anim_rects(json_path, "Idle")[:1]
+        order += load_anim_rects(json_path, "Move")[:3]
+        order += load_anim_rects(json_path, "Skid")[:1]
+        order += load_anim_rects(json_path, "Jump")[:1]
+        return order
 
-    small_order = []
-    small_order += load_anim_rects(mario_small_json, "Idle")[:1]
-    small_order += load_anim_rects(mario_small_json, "Move")[:3]
-    small_order += load_anim_rects(mario_small_json, "Skid")[:1]
-    small_order += load_anim_rects(mario_small_json, "Jump")[:1]
+    def big_anim_order(json_path: Path) -> list[list[int]]:
+        # Big sheets: Idle, Crouch, Move(3), Skid, Jump (7 frames)
+        order: list[list[int]] = []
+        order += load_anim_rects(json_path, "Idle")[:1]
+        order += load_anim_rects(json_path, "Crouch")[:1]
+        order += load_anim_rects(json_path, "Move")[:3]
+        order += load_anim_rects(json_path, "Skid")[:1]
+        order += load_anim_rects(json_path, "Jump")[:1]
+        return order
 
-    big_order = []
-    big_order += load_anim_rects(mario_big_json, "Idle")[:1]
-    big_order += load_anim_rects(mario_big_json, "Move")[:3]
-    big_order += load_anim_rects(mario_big_json, "Skid")[:1]
-    big_order += load_anim_rects(mario_big_json, "Jump")[:1]
+    def fire_anim_order(json_path: Path) -> list[list[int]]:
+        # Fire sheets: Idle, Crouch, Move(3), Skid, Jump, Attack, AirAttack (9 frames)
+        order: list[list[int]] = []
+        order += load_anim_rects(json_path, "Idle")[:1]
+        order += load_anim_rects(json_path, "Crouch")[:1]
+        order += load_anim_rects(json_path, "Move")[:3]
+        order += load_anim_rects(json_path, "Skid")[:1]
+        order += load_anim_rects(json_path, "Jump")[:1]
+        order += load_anim_rects(json_path, "Attack")[:1]
+        order += load_anim_rects(json_path, "AirAttack")[:1]
+        return order
 
     def union_bbox(img: Image.Image, frames: list[list[int]]) -> tuple[int, int]:
         max_w = 0
@@ -441,26 +476,42 @@ def build_character_sheets(output_dir: Path) -> None:
         return (max_w, max_h)
 
     def bake_frame(
-        frame: Image.Image, cw: int, ch: int, scale_w: int, scale_h: int
+        frame: Image.Image, cw: int, ch: int, scale_h: int
     ) -> Image.Image:
         bbox = frame.getbbox()
         if not bbox:
             return Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         frame = frame.crop(bbox)
-        scale = min(cw / scale_w, ch / scale_h)
+        # Scale to consistently fill the target height, then crop width if
+        # needed. This avoids "short" big characters (e.g. Luigi/Toadette)
+        # caused by rare wide frames forcing an overly small uniform scale.
+        scale = ch / scale_h
         nw = max(1, int(round(frame.width * scale)))
         nh = max(1, int(round(frame.height * scale)))
         resized = frame.resize((nw, nh), Image.NEAREST)
+        if resized.height > ch:
+            # Keep feet (bottom) aligned.
+            resized = resized.crop((0, resized.height - ch, resized.width, resized.height))
+        if resized.width > cw:
+            # Center-crop horizontally (keeps the sprite feeling centered).
+            left = (resized.width - cw) // 2
+            resized = resized.crop((left, 0, left + cw, resized.height))
         canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-        ox = (cw - nw) // 2
-        oy = ch - nh
+        ox = (cw - resized.width) // 2
+        oy = ch - resized.height
         canvas.paste(resized, (ox, oy))
         return canvas
 
     for name in chars:
         src_small = rem / f"Assets/Sprites/Players/{name}/Small.png"
         src_big = rem / f"Assets/Sprites/Players/{name}/Big.png"
+        src_fire = rem / f"Assets/Sprites/Players/{name}/Fire.png"
+        src_small_json = rem / f"Assets/Sprites/Players/{name}/Small.json"
+        src_big_json = rem / f"Assets/Sprites/Players/{name}/Big.json"
+        src_fire_json = rem / f"Assets/Sprites/Players/{name}/Fire.json"
         if not src_small.exists() or not src_big.exists():
+            continue
+        if not src_small_json.exists() or not src_big_json.exists():
             continue
 
         img_small = Image.open(src_small).convert("RGBA")
@@ -469,21 +520,36 @@ def build_character_sheets(output_dir: Path) -> None:
         out_dir = output_dir / "sprites/players" / name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        small_max_w, small_max_h = union_bbox(img_small, small_order)
-        sheet_small = Image.new("RGBA", (96, 16), (0, 0, 0, 0))
+        small_order = small_anim_order(src_small_json)
+        big_order = big_anim_order(src_big_json)
+
+        _, small_max_h = union_bbox(img_small, small_order)
+        sheet_small = Image.new("RGBA", (16 * len(small_order), 16), (0, 0, 0, 0))
         for i, (x, y, w, h) in enumerate(small_order):
             frame = img_small.crop((x, y, x + w, y + h))
-            frame = bake_frame(frame, 16, 16, small_max_w, small_max_h)
+            frame = bake_frame(frame, 16, 16, small_max_h)
             sheet_small.paste(frame, (i * 16, 0))
         sheet_small.save(out_dir / "Small.png")
 
-        big_max_w, big_max_h = union_bbox(img_big, big_order)
-        sheet_big = Image.new("RGBA", (96, 32), (0, 0, 0, 0))
+        _, big_max_h = union_bbox(img_big, big_order)
+        sheet_big = Image.new("RGBA", (16 * len(big_order), 32), (0, 0, 0, 0))
         for i, (x, y, w, h) in enumerate(big_order):
             frame = img_big.crop((x, y, x + w, y + h))
-            frame = bake_frame(frame, 16, 32, big_max_w, big_max_h)
+            frame = bake_frame(frame, 16, 32, big_max_h)
             sheet_big.paste(frame, (i * 16, 0))
         sheet_big.save(out_dir / "Big.png")
+
+        # Fire sheet (optional, but used for Fire power visuals in this port)
+        if src_fire.exists() and src_fire_json.exists():
+            img_fire = Image.open(src_fire).convert("RGBA")
+            fire_order = fire_anim_order(src_fire_json)
+            _, fire_max_h = union_bbox(img_fire, fire_order)
+            sheet_fire = Image.new("RGBA", (16 * len(fire_order), 32), (0, 0, 0, 0))
+            for i, (x, y, w, h) in enumerate(fire_order):
+                frame = img_fire.crop((x, y, x + w, y + h))
+                frame = bake_frame(frame, 16, 32, fire_max_h)
+                sheet_fire.paste(frame, (i * 16, 0))
+            sheet_fire.save(out_dir / "Fire.png")
 
         # Optional icon assets (if present)
         for icon_name in ["LifeIcon.png", "CharacterColour.png", "ColourPalette.png"]:

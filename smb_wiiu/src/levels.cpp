@@ -23,8 +23,10 @@ bool loadLevelSection(int levelIndex, int sectionIndex,
   out.theme = section.theme;
   out.flagX = section.flagX;
   out.hasFlag = section.hasFlag;
+  out.atlasT = section.atlasT;
   out.atlasX = section.atlasX;
   out.atlasY = section.atlasY;
+  out.collide = section.collide;
   out.qmeta = section.qmeta;
   out.pipes = section.pipes;
   out.pipeCount = section.pipeCount;
@@ -37,5 +39,8 @@ bool loadLevelSection(int levelIndex, int sectionIndex,
   out.startY = section.startY;
   out.mapWidth = section.mapWidth;
   out.mapHeight = section.mapHeight;
+  out.bgPrimary = section.bgPrimary;
+  out.bgSecondary = section.bgSecondary;
+  out.bgClouds = section.bgClouds;
   return true;
 }

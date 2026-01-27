@@ -14,7 +14,8 @@ enum Tile : uint8_t {
   T_USED,
   T_PIPE,
   T_FLAG,
-  T_CASTLE
+  T_CASTLE,
+  T_COIN
 };
 
 enum Power { P_SMALL = 0, P_BIG, P_FIRE };

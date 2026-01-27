@@ -19,6 +19,15 @@ Q_POWERUP = 1
 Q_ONEUP = 2
 Q_STAR = 3
 
+COL_NONE = 0
+COL_SOLID = 1
+COL_ONEWAY = 2
+
+ATLAS_NONE = 0
+ATLAS_TERRAIN = 1
+ATLAS_DECO = 2
+ATLAS_LIQUID = 3
+
 
 def question_meta_for_path(path: str | None) -> int:
     if not path:
@@ -45,6 +54,9 @@ class Node:
     target_sub_level: int | None
     enter_direction: int | None
     connecting_pipe: str | None
+    bg_primary_layer: int | None
+    bg_second_layer: int | None
+    bg_overlay_clouds: bool | None
 
 
 def parse_uid_map() -> dict[str, Path]:
@@ -91,6 +103,9 @@ def parse_nodes(lines: list[str], ext: dict[str, str]) -> list[Node]:
                 target_sub_level=None,
                 enter_direction=None,
                 connecting_pipe=None,
+                bg_primary_layer=None,
+                bg_second_layer=None,
+                bg_overlay_clouds=None,
             )
             nodes.append(cur)
             continue
@@ -122,8 +137,95 @@ def parse_nodes(lines: list[str], ext: dict[str, str]) -> list[Node]:
             m = re.search(r'NodePath\("([^"]+)"\)', line)
             if m:
                 cur.connecting_pipe = m.group(1).split("/")[-1]
+        elif line.startswith("primary_layer = "):
+            try:
+                cur.bg_primary_layer = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("second_layer = "):
+            try:
+                cur.bg_second_layer = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("overlay_clouds = "):
+            cur.bg_overlay_clouds = line.split("=", 1)[1].strip().lower() == "true"
 
     return nodes
+
+
+def resolve_res_path(path: str | None, uid_map: dict[str, Path]) -> Path | None:
+    if not path:
+        return None
+    if path.startswith("uid://"):
+        return uid_map.get(path)
+    if path.startswith("res://"):
+        rel = path.replace("res://", "")
+        return GODOT_ROOT / rel
+    return None
+
+
+def merge_nodes(base_nodes: list[Node], override_nodes: list[Node]) -> list[Node]:
+    # Merge by (parent, name). Apply overrides only when the field is explicitly
+    # provided in the override scene (or True for `exit_only`).
+    merged = [Node(**n.__dict__) for n in base_nodes]
+    index_by_key = {(n.parent, n.name): i for i, n in enumerate(merged)}
+
+    for o in override_nodes:
+        key = (o.parent, o.name)
+        if key in index_by_key:
+            b = merged[index_by_key[key]]
+            if o.resource_path is not None:
+                b.resource_path = o.resource_path
+            if o.position is not None:
+                b.position = o.position
+            if o.tile_map_data is not None:
+                b.tile_map_data = o.tile_map_data
+            if o.pipe_id is not None:
+                b.pipe_id = o.pipe_id
+            if o.exit_only:
+                b.exit_only = True
+            if o.target_level is not None:
+                b.target_level = o.target_level
+            if o.target_sub_level is not None:
+                b.target_sub_level = o.target_sub_level
+            if o.enter_direction is not None:
+                b.enter_direction = o.enter_direction
+            if o.connecting_pipe is not None:
+                b.connecting_pipe = o.connecting_pipe
+        else:
+            index_by_key[key] = len(merged)
+            merged.append(o)
+    return merged
+
+
+def parse_scene_with_inheritance(
+    path: Path, uid_map: dict[str, Path], depth: int = 0
+) -> tuple[list[str], dict[str, str], list[Node]]:
+    lines = path.read_text(errors="ignore").splitlines()
+    ext = parse_ext_resources(lines)
+    nodes = parse_nodes(lines, ext)
+
+    # Many SMB1 sub-scenes (e.g. `1-2a.tscn`) instance a base `.tscn` and only
+    # override a few fields. Merge the base scene so we don't lose inherited
+    # PipeArea positions/types.
+    if depth < 4:
+        root_inst = next(
+            (
+                n
+                for n in nodes
+                if n.parent == "" and n.resource_path and n.resource_path.endswith(".tscn")
+            ),
+            None,
+        )
+        base_path = resolve_res_path(root_inst.resource_path, uid_map) if root_inst else None
+        if base_path and base_path.exists() and base_path != path:
+            base_lines, base_ext, base_nodes = parse_scene_with_inheritance(
+                base_path, uid_map, depth + 1
+            )
+            nodes = merge_nodes(base_nodes, nodes)
+            # Keep ext from the child scene; resource paths for instanced nodes
+            # are already resolved during parsing.
+    return lines, ext, nodes
 
 
 def parse_tileset_scene_map() -> tuple[int, dict[int, str]]:
@@ -157,6 +259,95 @@ def parse_tileset_scene_map() -> tuple[int, dict[int, str]]:
             if ext_id in ext:
                 scene_map[scene_id] = ext[ext_id]
     return scene_source_index, scene_map
+
+
+def parse_tileset_atlas_kinds_and_collision() -> tuple[dict[int, int], dict[tuple[int, int, int], int]]:
+    tiles_path = GODOT_ROOT / "Scenes/Parts/Tiles.tscn"
+    if not tiles_path.exists():
+        return {}, {}
+
+    lines = tiles_path.read_text(errors="ignore").splitlines()
+    ext = parse_ext_resources(lines)
+
+    atlas_subres_to_tex: dict[str, str] = {}
+    atlas_subres_to_collide: dict[str, dict[tuple[int, int], int]] = {}
+
+    cur_atlas: str | None = None
+    for raw in lines:
+        line = raw.strip()
+        m = re.match(r'^\[sub_resource type="TileSetAtlasSource" id="([^"]+)"\]', line)
+        if m:
+            cur_atlas = m.group(1)
+            atlas_subres_to_collide[cur_atlas] = {}
+            continue
+        if cur_atlas is None:
+            continue
+        if line.startswith("["):
+            cur_atlas = None
+            continue
+
+        if line.startswith("texture = ExtResource("):
+            mtex = re.search(r'ExtResource\("([^"]+)"\)', line)
+            if mtex:
+                tex_path = ext.get(mtex.group(1))
+                if tex_path:
+                    atlas_subres_to_tex[cur_atlas] = tex_path
+            continue
+
+        # Only export collisions for physics_layer_0. The tileset also contains
+        # extra physics layers (different collision layer/mask) that are not
+        # meant to block the player.
+        mp = re.match(
+            r"^(\d+):(\d+)/\d+/physics_layer_0/polygon_\d+/points\s*=",
+            line,
+        )
+        if mp:
+            ax = int(mp.group(1))
+            ay = int(mp.group(2))
+            prev = atlas_subres_to_collide[cur_atlas].get((ax, ay), COL_NONE)
+            if prev != COL_ONEWAY:
+                atlas_subres_to_collide[cur_atlas][(ax, ay)] = COL_SOLID
+            continue
+
+        mow = re.match(
+            r"^(\d+):(\d+)/\d+/physics_layer_0/polygon_\d+/one_way\s*=\s*true",
+            line,
+        )
+        if mow:
+            ax = int(mow.group(1))
+            ay = int(mow.group(2))
+            atlas_subres_to_collide[cur_atlas][(ax, ay)] = COL_ONEWAY
+            continue
+
+    source_index_to_kind: dict[int, int] = {}
+    source_index_to_atlas_subres: dict[int, str] = {}
+    for raw in lines:
+        line = raw.strip()
+        m = re.match(r'^sources/(\d+)\s*=\s*SubResource\("([^"]+)"\)', line)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        sub = m.group(2)
+        if sub in atlas_subres_to_collide:
+            source_index_to_atlas_subres[idx] = sub
+
+    for idx, sub in source_index_to_atlas_subres.items():
+        tex_path = atlas_subres_to_tex.get(sub, "")
+        if "/Tilesets/Terrain/" in tex_path:
+            source_index_to_kind[idx] = ATLAS_TERRAIN
+        elif "/Tilesets/Deco/" in tex_path:
+            source_index_to_kind[idx] = ATLAS_DECO
+        elif "Liquids" in tex_path or "/Tilesets/Liquid" in tex_path:
+            source_index_to_kind[idx] = ATLAS_LIQUID
+        else:
+            source_index_to_kind[idx] = ATLAS_NONE
+
+    collision_by_source: dict[tuple[int, int, int], int] = {}
+    for idx, sub in source_index_to_atlas_subres.items():
+        for (ax, ay), ct in atlas_subres_to_collide.get(sub, {}).items():
+            collision_by_source[(idx, ax, ay)] = ct
+
+    return source_index_to_kind, collision_by_source
 
 
 def decode_tile_map_data(encoded: str) -> list[tuple[int, int, int, int, int, int]]:
@@ -226,15 +417,15 @@ def to_tile(pos: tuple[float, float], x_offset: int, y_offset: int) -> tuple[int
 def build_levels():
     uid_map = parse_uid_map()
     scene_source_index, scene_map = parse_tileset_scene_map()
+    source_kind, collision_by_source = parse_tileset_atlas_kinds_and_collision()
+    terrain_source = next((k for k, v in sorted(source_kind.items()) if v == ATLAS_TERRAIN), 0)
 
     level_files = sorted(LEVELS_ROOT.rglob("*.tscn"))
     sections = []
     section_key_to_index: dict[tuple[int, int, int], int] = {}
 
     for path in level_files:
-        text = path.read_text(errors="ignore")
-        lines = text.splitlines()
-        ext = parse_ext_resources(lines)
+        lines, ext, nodes = parse_scene_with_inheritance(path, uid_map)
         music_path = None
         for line in lines:
             if "music = ExtResource" in line:
@@ -242,7 +433,6 @@ def build_levels():
                 if m and m.group(1) in ext:
                     music_path = ext[m.group(1)]
                 break
-        nodes = parse_nodes(lines, ext)
 
         tile_node = next((n for n in nodes if n.tile_map_data), None)
         if not tile_node:
@@ -263,14 +453,16 @@ def build_levels():
 
         # base map
         grid = [[0 for _ in range(MAP_W)] for _ in range(MAP_H)]
+        atlas_t = [[ATLAS_NONE for _ in range(MAP_W)] for _ in range(MAP_H)]
         atlas_x = [[255 for _ in range(MAP_W)] for _ in range(MAP_H)]
         atlas_y = [[255 for _ in range(MAP_W)] for _ in range(MAP_H)]
+        collide = [[COL_NONE for _ in range(MAP_W)] for _ in range(MAP_H)]
         qmeta = [[0 for _ in range(MAP_W)] for _ in range(MAP_H)]
         for x, y, source, ax, ay, _alt in cells:
             # The SMB1 terrain set encodes base ground as three stacked rows at
             # the bottom. To match the classic two-row ground thickness, drop
             # the lowest of those three rows.
-            if source == 0 and y == max_y:
+            if source == terrain_source and y == max_y:
                 continue
             tx = x + x_offset
             ty = y + y_offset
@@ -281,22 +473,39 @@ def build_levels():
                     scene_path = scene_map.get(scene_id)
                     if scene_path and "DeathPit" in scene_path:
                         grid[ty][tx] = 0  # T_EMPTY
+                        collide[ty][tx] = COL_NONE
+                    elif (
+                        scene_path
+                        and "/Scenes/Prefabs/Entities/Items/" in scene_path
+                        and "Coin" in scene_path
+                    ):
+                        # Collectible coin entities placed in the TileMap.
+                        grid[ty][tx] = 8  # T_COIN
+                        collide[ty][tx] = COL_NONE
                     elif scene_path and "QuestionBlock" in scene_path:
                         grid[ty][tx] = 3  # T_QUESTION
                         qmeta[ty][tx] = question_meta_for_path(scene_path)
+                        collide[ty][tx] = COL_SOLID
                     elif scene_path and "BrickBlock" in scene_path:
                         grid[ty][tx] = 2  # T_BRICK
+                        collide[ty][tx] = COL_SOLID
                     else:
-                        grid[ty][tx] = 1  # default solid
+                        grid[ty][tx] = 1  # default solid tile (visible)
+                        collide[ty][tx] = COL_SOLID
+                    atlas_t[ty][tx] = ATLAS_NONE
                     atlas_x[ty][tx] = 255
                     atlas_y[ty][tx] = 255
                 else:
-                    grid[ty][tx] = 1  # T_GROUND
-                    if source == 0:
-                        atlas_x[ty][tx] = ax & 0xFF
-                        atlas_y[ty][tx] = ay & 0xFF
-                        if ax == 9:
-                            grid[ty][tx] = 5  # T_PIPE
+                    kind = source_kind.get(source, ATLAS_NONE)
+                    if kind == ATLAS_NONE:
+                        continue
+                    grid[ty][tx] = 255
+                    atlas_t[ty][tx] = kind
+                    atlas_x[ty][tx] = ax & 0xFF
+                    atlas_y[ty][tx] = ay & 0xFF
+                    collide[ty][tx] = collision_by_source.get(
+                        (source, ax & 0xFF, ay & 0xFF), COL_NONE
+                    )
 
         # node-driven overlays / metadata
         pipes_entry = []
@@ -307,14 +516,24 @@ def build_levels():
         has_flag = False
         castle_pos = None
         spawn_pos = None
+        bg_primary = 0
+        bg_secondary = 0
+        bg_clouds = False
 
         for n in nodes:
-            if not n.resource_path or n.position is None:
+            if not n.resource_path:
                 continue
             if n.parent.startswith("ChallengeModeNodes"):
                 continue
 
             res = n.resource_path
+            if res.endswith("LevelBG.tscn"):
+                bg_primary = n.bg_primary_layer or 0
+                bg_secondary = n.bg_second_layer or 0
+                bg_clouds = bool(n.bg_overlay_clouds)
+                continue
+            if n.position is None:
+                continue
             if "Player.tscn" in res:
                 spawn_pos = n.position
             if "EndFlagpole.tscn" in res:
@@ -335,12 +554,16 @@ def build_levels():
                 tx, ty = to_tile(n.position, x_offset, y_offset)
                 if 0 <= tx < MAP_W and 0 <= ty < MAP_H:
                     grid[ty][tx] = 2  # T_BRICK
+                    collide[ty][tx] = COL_SOLID
+                    atlas_t[ty][tx] = ATLAS_NONE
                     atlas_x[ty][tx] = 255
                     atlas_y[ty][tx] = 255
             if "QuestionBlock" in res:
                 tx, ty = to_tile(n.position, x_offset, y_offset)
                 if 0 <= tx < MAP_W and 0 <= ty < MAP_H:
                     grid[ty][tx] = 3  # T_QUESTION
+                    collide[ty][tx] = COL_SOLID
+                    atlas_t[ty][tx] = ATLAS_NONE
                     atlas_x[ty][tx] = 255
                     atlas_y[ty][tx] = 255
                     qmeta[ty][tx] = question_meta_for_path(res)
@@ -348,13 +571,22 @@ def build_levels():
             if res.endswith("PipeArea.tscn") or res.endswith("AutoExitPipeArea.tscn") or res.endswith("TeleportPipeArea.tscn") or res.endswith("WarpPipeArea.tscn"):
                 tx, ty = to_tile(n.position, x_offset, y_offset)
                 pipe_pos_by_name[n.name] = (tx, ty)
-                # build pipe column down to ground
-                ground_y = min(max_y + y_offset, MAP_H - 1)
-                for y in range(ty, ground_y + 1):
-                    if 0 <= y < MAP_H and 0 <= tx < MAP_W:
-                        grid[y][tx] = 5  # T_PIPE
-                    if 0 <= y < MAP_H and 0 <= tx + 1 < MAP_W:
-                        grid[y][tx + 1] = 5
+                # For collision-only safety, optionally stamp a vertical pipe
+                # column IF tiles are missing. Avoid stamping sideways pipes,
+                # and avoid overriding real atlas-rendered pipes (causes
+                # duplicate/incorrect visuals in the port).
+                enter_dir = n.enter_direction if n.enter_direction is not None else 0
+                if enter_dir in (0, 1):
+                    ground_y = min(max_y + y_offset, MAP_H - 1)
+                    for y in range(ty, ground_y + 1):
+                        if 0 <= y < MAP_H and 0 <= tx < MAP_W:
+                            if grid[y][tx] == 0 and atlas_x[y][tx] == 255 and atlas_y[y][tx] == 255:
+                                # Collision-only marker: keep the tile visually empty so it never renders,
+                                # but ensure collision exists for the PipeArea bounds.
+                                collide[y][tx] = COL_SOLID
+                        if 0 <= y < MAP_H and 0 <= tx + 1 < MAP_W:
+                            if grid[y][tx + 1] == 0 and atlas_x[y][tx + 1] == 255 and atlas_y[y][tx + 1] == 255:
+                                collide[y][tx + 1] = COL_SOLID
                 if res.endswith("TeleportPipeArea.tscn") and n.connecting_pipe and not n.exit_only:
                     pipes_entry.append(
                         {
@@ -390,6 +622,7 @@ def build_levels():
                 for x in range(cx, cx + 5):
                     if 0 <= x < MAP_W and 0 <= y < MAP_H:
                         grid[y][x] = 7  # T_CASTLE
+                        collide[y][x] = COL_SOLID
 
         # spawn
         if spawn_pos:
@@ -450,14 +683,19 @@ def build_levels():
                 "stage": stage,
                 "section": section,
                 "grid": grid,
+                "atlas_t": atlas_t,
                 "atlas_x": atlas_x,
                 "atlas_y": atlas_y,
+                "collide": collide,
                 "qmeta": qmeta,
                 "map_width": min(width, MAP_W),
                 "map_height": MAP_H,
                 "theme": theme,
                 "flag_x": flag_x,
                 "has_flag": has_flag,
+                "bg_primary": bg_primary,
+                "bg_secondary": bg_secondary,
+                "bg_clouds": bg_clouds,
                 "pipes_entry": pipes_entry,
                 "pipes_exit": pipes_exit,
                 "pipe_pos_by_name": pipe_pos_by_name,
@@ -476,7 +714,191 @@ def build_levels():
     for s in sections:
         level_sections[(s["world"], s["stage"])].append(s)
 
+    def parse_special_section(path: Path, world: int, stage: int, section: int):
+        # Re-run the same parsing logic for a special scene (e.g. UndergroundExit)
+        # but force it into the given (world, stage, section) bucket.
+        lines, ext, nodes = parse_scene_with_inheritance(path, uid_map)
+        music_path = None
+        for line in lines:
+            if "music = ExtResource" in line:
+                m = re.search(r'ExtResource\("([^"]+)"\)', line)
+                if m and m.group(1) in ext:
+                    music_path = ext[m.group(1)]
+                break
+
+        tile_node = next((n for n in nodes if n.tile_map_data), None)
+        if not tile_node:
+            return None
+        cells = decode_tile_map_data(tile_node.tile_map_data or "")
+        if not cells:
+            return None
+
+        xs = [c[0] for c in cells]
+        ys = [c[1] for c in cells]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        width = max_x - min_x + 1
+        x_offset = -min_x
+        y_offset = MAP_H - max_y
+
+        grid = [[0 for _ in range(MAP_W)] for _ in range(MAP_H)]
+        atlas_t = [[ATLAS_NONE for _ in range(MAP_W)] for _ in range(MAP_H)]
+        atlas_x = [[255 for _ in range(MAP_W)] for _ in range(MAP_H)]
+        atlas_y = [[255 for _ in range(MAP_W)] for _ in range(MAP_H)]
+        collide = [[COL_NONE for _ in range(MAP_W)] for _ in range(MAP_H)]
+        qmeta = [[0 for _ in range(MAP_W)] for _ in range(MAP_H)]
+
+        for x, y, source, ax, ay, _alt in cells:
+            if source == terrain_source and y == max_y:
+                continue
+            tx = x + x_offset
+            ty = y + y_offset
+            if 0 <= tx < MAP_W and 0 <= ty < MAP_H:
+                if source == scene_source_index:
+                    scene_id = _alt if _alt > 0 else (ax + 1)
+                    scene_path = scene_map.get(scene_id)
+                    if scene_path and "DeathPit" in scene_path:
+                        grid[ty][tx] = 0
+                        collide[ty][tx] = COL_NONE
+                    elif (
+                        scene_path
+                        and "/Scenes/Prefabs/Entities/Items/" in scene_path
+                        and "Coin" in scene_path
+                    ):
+                        grid[ty][tx] = 8  # T_COIN
+                        collide[ty][tx] = COL_NONE
+                    elif scene_path and "QuestionBlock" in scene_path:
+                        grid[ty][tx] = 3
+                        qmeta[ty][tx] = question_meta_for_path(scene_path)
+                        collide[ty][tx] = COL_SOLID
+                    elif scene_path and "BrickBlock" in scene_path:
+                        grid[ty][tx] = 2
+                        collide[ty][tx] = COL_SOLID
+                    else:
+                        grid[ty][tx] = 1
+                        collide[ty][tx] = COL_SOLID
+                    atlas_t[ty][tx] = ATLAS_NONE
+                    atlas_x[ty][tx] = 255
+                    atlas_y[ty][tx] = 255
+                else:
+                    kind = source_kind.get(source, ATLAS_NONE)
+                    if kind == ATLAS_NONE:
+                        continue
+                    grid[ty][tx] = 255
+                    atlas_t[ty][tx] = kind
+                    atlas_x[ty][tx] = ax & 0xFF
+                    atlas_y[ty][tx] = ay & 0xFF
+                    collide[ty][tx] = collision_by_source.get(
+                        (source, ax & 0xFF, ay & 0xFF), COL_NONE
+                    )
+
+        pipes_entry = []
+        pipes_exit: dict[int, tuple[int, int]] = {}
+        pipe_pos_by_name: dict[str, tuple[int, int]] = {}
+        enemies = []
+        flag_x = 0
+        has_flag = False
+        castle_pos = None
+        spawn_pos = None
+        bg_primary = 0
+        bg_secondary = 0
+        bg_clouds = False
+
+        for n in nodes:
+            if not n.resource_path:
+                continue
+            if n.parent.startswith("ChallengeModeNodes"):
+                continue
+            res = n.resource_path
+            if res.endswith("LevelBG.tscn"):
+                bg_primary = n.bg_primary_layer or 0
+                bg_secondary = n.bg_second_layer or 0
+                bg_clouds = bool(n.bg_overlay_clouds)
+                continue
+            if n.position is None:
+                continue
+            if "Player.tscn" in res:
+                spawn_pos = n.position
+            if "EndFlagpole.tscn" in res:
+                tx, ty = to_tile(n.position, x_offset, y_offset)
+                flag_x = tx
+                has_flag = True
+            if "EndSmallCastle.tscn" in res or "EndFinalCastle.tscn" in res:
+                castle_pos = to_tile(n.position, x_offset, y_offset)
+
+            if res.endswith("PipeArea.tscn") or res.endswith("AutoExitPipeArea.tscn") or res.endswith("TeleportPipeArea.tscn") or res.endswith("WarpPipeArea.tscn"):
+                tx, ty = to_tile(n.position, x_offset, y_offset)
+                pipe_pos_by_name[n.name] = (tx, ty)
+                pid = n.pipe_id or 0
+                if n.exit_only:
+                    pipes_exit[pid] = (tx, ty)
+                else:
+                    pipes_entry.append(
+                        {
+                            "pipe_id": pid,
+                            "tx": tx,
+                            "ty": ty,
+                            "target_level": n.target_level,
+                            "target_sub_level": n.target_sub_level or 0,
+                            "enter_dir": n.enter_direction if n.enter_direction is not None else 0,
+                        }
+                    )
+
+        if castle_pos:
+            cx, cy = castle_pos
+            for y in range(cy - 2, cy + 3):
+                for x in range(cx, cx + 5):
+                    if 0 <= x < MAP_W and 0 <= y < MAP_H:
+                        grid[y][x] = 7  # T_CASTLE
+                        collide[y][x] = COL_SOLID
+
+        if spawn_pos:
+            sx, sy = to_tile(spawn_pos, x_offset, y_offset)
+        else:
+            sx, sy = 3, max_y + y_offset - 1
+        sx_px = clamp(sx, 0, MAP_W - 1) * TILE
+        sy_px = clamp(sy, 0, MAP_H - 1) * TILE
+
+        theme = "THEME_OVERWORLD"
+        if music_path:
+            if "Underground" in music_path:
+                theme = "THEME_UNDERGROUND"
+            elif "CastleWater" in music_path:
+                theme = "THEME_CASTLE_WATER"
+            elif "Castle" in music_path or "Bowser" in music_path:
+                theme = "THEME_CASTLE"
+            elif "Underwater" in music_path:
+                theme = "THEME_UNDERWATER"
+        return {
+            "path": path,
+            "world": world,
+            "stage": stage,
+            "section": section,
+            "grid": grid,
+            "atlas_t": atlas_t,
+            "atlas_x": atlas_x,
+            "atlas_y": atlas_y,
+            "collide": collide,
+            "qmeta": qmeta,
+            "map_width": min(width, MAP_W),
+            "map_height": MAP_H,
+            "theme": theme,
+            "flag_x": flag_x,
+            "has_flag": has_flag,
+            "bg_primary": bg_primary,
+            "bg_secondary": bg_secondary,
+            "bg_clouds": bg_clouds,
+            "pipes_entry": pipes_entry,
+            "pipes_exit": pipes_exit,
+            "pipe_pos_by_name": pipe_pos_by_name,
+            "enemies": enemies,
+            "start_x": sx_px,
+            "start_y": sy_px,
+        }
+
     # resolve pipes
+    special_by_level: dict[tuple[int, int, str], int] = {}
+    special_sections: list[dict] = []
     for s in sections:
         for entry in s["pipes_entry"]:
             if entry.get("connect_name"):
@@ -486,7 +908,7 @@ def build_levels():
                     tgt_key = (s["world"], s["stage"])
                     if tgt_key in level_index_map:
                         entry["target_level_index"] = level_index_map[tgt_key]
-                        entry["target_section_index"] = s["section"]
+                        entry["target_section_number"] = s["section"]
                         entry["target_x_px"] = target_x * TILE
                         entry["target_y_px"] = target_y * TILE
                 continue
@@ -495,6 +917,40 @@ def build_levels():
                 continue
             target_id = parse_level_id(target_path)
             if not target_id:
+                # Special shared scenes (e.g. UndergroundExit.tscn) - embed as an
+                # extra section inside the *current* level so HUD world/stage
+                # remains consistent.
+                stem = target_path.stem
+                if stem in ("UndergroundExit", "UnderwaterExit"):
+                    key = (s["world"], s["stage"], stem)
+                    if key not in special_by_level:
+                        base_key = (s["world"], s["stage"])
+                        existing = [sec["section"] for sec in level_sections.get(base_key, [])]
+                        next_section = (max(existing) + 1) if existing else 1
+                        sec = parse_special_section(target_path, s["world"], s["stage"], next_section)
+                        if sec:
+                            special_by_level[key] = next_section
+                            special_sections.append(sec)
+                            level_sections.setdefault(base_key, []).append(sec)
+                    if key in special_by_level:
+                        base_key = (s["world"], s["stage"])
+                        sec_num = special_by_level[key]
+                        sec_obj = next(
+                            (sec for sec in level_sections.get(base_key, []) if sec["section"] == sec_num),
+                            None,
+                        )
+                        if sec_obj:
+                            pid = entry["pipe_id"]
+                            exit_pos = sec_obj["pipes_exit"].get(pid)
+                            if exit_pos:
+                                target_x, target_y = exit_pos
+                            else:
+                                target_x = sec_obj["start_x"] // TILE
+                                target_y = (sec_obj["start_y"] // TILE)
+                            entry["target_level_index"] = level_index_map[base_key]
+                            entry["target_section_number"] = sec_num
+                            entry["target_x_px"] = target_x * TILE
+                            entry["target_y_px"] = target_y * TILE
                 continue
             t_world, t_stage, t_section = target_id
             if t_section == 0:
@@ -517,17 +973,34 @@ def build_levels():
                 target_x = target_section["start_x"] // TILE
                 target_y = (target_section["start_y"] // TILE)
             entry["target_level_index"] = tgt_level_idx
-            entry["target_section_index"] = t_section
+            entry["target_section_number"] = t_section
             entry["target_x_px"] = target_x * TILE
             entry["target_y_px"] = target_y * TILE
+
+    # Build per-level section-number -> array-index mapping (PipeLink uses array indices).
+    section_index_map: dict[tuple[int, int], dict[int, int]] = {}
+    for k in level_keys:
+        sec_list = sorted(level_sections[k], key=lambda s: s["section"])
+        level_sections[k] = sec_list
+        section_index_map[k] = {sec["section"]: i for i, sec in enumerate(sec_list)}
 
     # emit C++
     out = []
     out.append('#include "levels.h"')
     out.append("")
 
-    # maps
-    for s in sections:
+    # maps (include any embedded special sections)
+    emit_sections = []
+    seen = set()
+    for k in level_keys:
+        for s in level_sections[k]:
+            key = (s["world"], s["stage"], s["section"])
+            if key in seen:
+                continue
+            seen.add(key)
+            emit_sections.append(s)
+
+    for s in emit_sections:
         name = f"map_{s['world']}_{s['stage']}_{s['section']}"
         out.append(f"static const uint8_t {name}[MAP_H][MAP_W] = {{")
         for row in s["grid"]:
@@ -535,9 +1008,16 @@ def build_levels():
         out.append("};")
         out.append("")
 
+        at_name = f"atlast_{s['world']}_{s['stage']}_{s['section']}"
         ax_name = f"atlasx_{s['world']}_{s['stage']}_{s['section']}"
         ay_name = f"atlasy_{s['world']}_{s['stage']}_{s['section']}"
+        col_name = f"collide_{s['world']}_{s['stage']}_{s['section']}"
         qm_name = f"qmeta_{s['world']}_{s['stage']}_{s['section']}"
+        out.append(f"static const uint8_t {at_name}[MAP_H][MAP_W] = {{")
+        for row in s['atlas_t']:
+            out.append('  {' + ','.join(str(v) for v in row) + '},')
+        out.append("};")
+        out.append("")
         out.append(f"static const uint8_t {ax_name}[MAP_H][MAP_W] = {{")
         for row in s["atlas_x"]:
             out.append("  {" + ",".join(str(v) for v in row) + "},")
@@ -548,6 +1028,11 @@ def build_levels():
             out.append("  {" + ",".join(str(v) for v in row) + "},")
         out.append("};")
         out.append("")
+        out.append(f"static const uint8_t {col_name}[MAP_H][MAP_W] = {{")
+        for row in s['collide']:
+            out.append('  {' + ','.join(str(v) for v in row) + '},')
+        out.append("};")
+        out.append("")
         out.append(f"static const uint8_t {qm_name}[MAP_H][MAP_W] = {{")
         for row in s["qmeta"]:
             out.append("  {" + ",".join(str(v) for v in row) + "},")
@@ -555,17 +1040,21 @@ def build_levels():
         out.append("")
 
     # pipes and enemies
-    for s in sections:
+    for s in emit_sections:
         pipes = [
             e
             for e in s["pipes_entry"]
-            if "target_level_index" in e and "target_section_index" in e
+            if "target_level_index" in e and "target_section_number" in e
         ]
         pname = f"pipes_{s['world']}_{s['stage']}_{s['section']}"
         out.append(f"static const PipeLink {pname}[] = {{")
         for p in pipes:
+            tgt_key = level_keys[p["target_level_index"]]
+            tgt_section_idx = section_index_map[tgt_key].get(p["target_section_number"])
+            if tgt_section_idx is None:
+                continue
             out.append(
-                f"  {{{p['tx']}, {p['ty']}, {p['target_level_index']}, {p['target_section_index']}, {p['target_x_px']}, {p['target_y_px']}, {p.get('enter_dir', 0)}}},"
+                f"  {{{p['tx']}, {p['ty']}, {p['target_level_index']}, {tgt_section_idx}, {p.get('target_x_px', 0)}, {p.get('target_y_px', 0)}, {p.get('enter_dir', 0)}}},"
             )
         out.append("};")
         out.append("")
@@ -585,8 +1074,10 @@ def build_levels():
         out.append(f"static const LevelSectionData {sname}[] = {{")
         for s in sec_list:
             map_name = f"map_{s['world']}_{s['stage']}_{s['section']}"
+            at_name = f"atlast_{s['world']}_{s['stage']}_{s['section']}"
             ax_name = f"atlasx_{s['world']}_{s['stage']}_{s['section']}"
             ay_name = f"atlasy_{s['world']}_{s['stage']}_{s['section']}"
+            col_name = f"collide_{s['world']}_{s['stage']}_{s['section']}"
             qm_name = f"qmeta_{s['world']}_{s['stage']}_{s['section']}"
             pname = f"pipes_{s['world']}_{s['stage']}_{s['section']}"
             ename = f"enemies_{s['world']}_{s['stage']}_{s['section']}"
@@ -594,16 +1085,17 @@ def build_levels():
                 [
                     e
                     for e in s["pipes_entry"]
-                    if "target_level_index" in e and "target_section_index" in e
+                    if "target_level_index" in e and "target_section_number" in e
                 ]
             )
             enemy_count = len(s["enemies"])
             out.append(
                 "  {"
-                f"{map_name}, {ax_name}, {ay_name}, {qm_name}, "
+                f"{map_name}, {at_name}, {ax_name}, {ay_name}, {col_name}, {qm_name}, "
                 f"{s['map_width']}, {s['map_height']}, {s['theme']}, "
                 f"{s['flag_x']}, {str(s['has_flag']).lower()}, "
                 f"{s['start_x']}, {s['start_y']}, "
+                f"{s.get('bg_primary', 0)}, {s.get('bg_secondary', 0)}, {str(bool(s.get('bg_clouds'))).lower()}, "
                 f"{pname}, {pipe_count}, {ename}, {enemy_count}"
                 "},"
             )
