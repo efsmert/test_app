@@ -7,6 +7,7 @@
 #include <cmath>
 #include <vector>
 #include <utility>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -299,9 +300,102 @@ int textWidth(const char *text, int scale) {
   return len * 6 * scale;
 }
 
+constexpr int SPRITE_SHADOW_OFS = 2;
+constexpr uint8_t SPRITE_SHADOW_ALPHA = 90;
+
+struct TextureModGuard {
+  SDL_Texture *t = nullptr;
+  Uint8 r = 255, g = 255, b = 255, a = 255;
+  explicit TextureModGuard(SDL_Texture *tex) : t(tex) {
+    if (!t)
+      return;
+    SDL_GetTextureColorMod(t, &r, &g, &b);
+    SDL_GetTextureAlphaMod(t, &a);
+  }
+  ~TextureModGuard() {
+    if (!t)
+      return;
+    SDL_SetTextureColorMod(t, r, g, b);
+    SDL_SetTextureAlphaMod(t, a);
+  }
+};
+
+void renderCopyExWithShadow(SDL_Texture *tex, const SDL_Rect *src,
+                            const SDL_Rect *dst, SDL_RendererFlip flip) {
+  if (!tex || !dst)
+    return;
+
+  TextureModGuard guard(tex);
+
+  SDL_Rect shadowDst = *dst;
+  shadowDst.x += SPRITE_SHADOW_OFS;
+  shadowDst.y += SPRITE_SHADOW_OFS;
+
+  SDL_SetTextureColorMod(tex, 0, 0, 0);
+  SDL_SetTextureAlphaMod(tex, SPRITE_SHADOW_ALPHA);
+  SDL_RenderCopyEx(g_ren, tex, src, &shadowDst, 0, nullptr, flip);
+
+  SDL_SetTextureColorMod(tex, 255, 255, 255);
+  SDL_SetTextureAlphaMod(tex, 255);
+  SDL_RenderCopyEx(g_ren, tex, src, dst, 0, nullptr, flip);
+}
+
+void renderCopyExWithShadowAngle(SDL_Texture *tex, const SDL_Rect *src,
+                                 const SDL_Rect *dst, double angle,
+                                 SDL_RendererFlip flip,
+                                 const SDL_Point *center) {
+  if (!tex || !dst)
+    return;
+
+  TextureModGuard guard(tex);
+
+  SDL_Rect shadowDst = *dst;
+  shadowDst.x += SPRITE_SHADOW_OFS;
+  shadowDst.y += SPRITE_SHADOW_OFS;
+
+  SDL_SetTextureColorMod(tex, 0, 0, 0);
+  SDL_SetTextureAlphaMod(tex, SPRITE_SHADOW_ALPHA);
+  SDL_RenderCopyEx(g_ren, tex, src, &shadowDst, angle, center, flip);
+
+  SDL_SetTextureColorMod(tex, 255, 255, 255);
+  SDL_SetTextureAlphaMod(tex, 255);
+  SDL_RenderCopyEx(g_ren, tex, src, dst, angle, center, flip);
+}
+
+void renderCopyWithShadow(SDL_Texture *tex, const SDL_Rect *src,
+                          const SDL_Rect *dst) {
+  renderCopyExWithShadow(tex, src, dst, SDL_FLIP_NONE);
+}
+
+void renderTall16x32WithShadow(SDL_Texture *tex, int frameX, const SDL_Rect &dst,
+                               SDL_RendererFlip flip) {
+  SDL_Rect dstTop = dst;
+  dstTop.h = dst.h / 2;
+  SDL_Rect dstBot = dstTop;
+  dstBot.y += dstTop.h;
+
+  SDL_Rect srcTop = {frameX, 0, 16, 16};
+  SDL_Rect srcBot = {frameX, 16, 16, 16};
+
+  renderCopyExWithShadow(tex, &srcTop, &dstTop, flip);
+  renderCopyExWithShadow(tex, &srcBot, &dstBot, flip);
+}
+
 bool overlap(const Rect &a, const Rect &b) {
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h &&
          a.y + a.h > b.y;
+}
+
+inline bool jumpPressed() {
+  return (g_pressed & (VPAD_BUTTON_A | VPAD_BUTTON_B)) != 0;
+}
+
+inline bool jumpHeld() {
+  return (g_held & (VPAD_BUTTON_A | VPAD_BUTTON_B)) != 0;
+}
+
+inline bool firePressed() {
+  return (g_pressed & (VPAD_BUTTON_X | VPAD_BUTTON_Y)) != 0;
 }
 
 int mapWidth() { return g_levelInfo.mapWidth > 0 ? g_levelInfo.mapWidth : MAP_W; }
@@ -424,15 +518,8 @@ int fireFlowerRowForTheme(LevelTheme t) {
   }
 }
 
-SDL_Rect firePlayerSrcForFrame(int frame) {
-  // Fire sheets are exported as 16x32 frames (matching the Big sheet layout),
-  // with extra attack frames appended.
-  return {frame * 16, 0, 16, 32};
-}
-
 bool playerStomp(const Rect &enemy) {
-  float playerBottom = g_p.r.y + g_p.r.h;
-  return g_p.vy >= -20.0f && playerBottom <= enemy.y + 6.0f;
+  return g_p.vy > 0.0f;
 }
 
 SDL_Texture *loadTex(const char *file) {
@@ -1101,7 +1188,7 @@ void spawnEnemiesFromLevel() {
     const EnemySpawn &s = g_levelInfo.enemies[i];
     g_ents[idx].on = true;
     g_ents[idx].type = s.type;
-    float h = s.type == E_KOOPA ? 24.f : 16.f;
+    float h = 16.f;
     float y = s.y - (h - 16.0f);
     g_ents[idx].r = {s.x, y, 16.f, h};
     g_ents[idx].vx = (s.type == E_GOOMBA || s.type == E_KOOPA)
@@ -1703,7 +1790,7 @@ void spawnFireball() {
     if (!g_ents[i].on) {
       float x = g_p.r.x + (g_p.right ? g_p.r.w - 4 : -4);
       float y = g_p.r.y + (g_p.r.h * 0.5f);
-      g_ents[i] = {true, E_FIREBALL, {x, y, 16, 16}, 0, -120, g_p.right ? 1 : -1, 0, 0};
+      g_ents[i] = {true, E_FIREBALL, {x, y, 16, 16}, 0, -90, g_p.right ? 1 : -1, 0, 0};
       g_fireCooldown = 0.35f;
       g_p.throwT = 0.15f;
       if (g_sfxFireball)
@@ -1757,7 +1844,7 @@ void updatePlayer(float dt) {
     g_p.right = false;
   }
 
-  if (g_p.power == P_FIRE && (g_pressed & VPAD_BUTTON_B) && !g_p.crouch) {
+  if (g_p.power == P_FIRE && firePressed() && !g_p.crouch) {
     spawnFireball();
   }
 
@@ -1874,7 +1961,7 @@ void updatePlayer(float dt) {
     }
   }
 
-  if ((g_pressed & VPAD_BUTTON_B) && g_p.ground) {
+  if (jumpPressed() && g_p.ground) {
     float jumpHeight = Physics::JUMP_HEIGHT;
     if (fabsf(g_p.vx) > Physics::WALK_SPEED * 0.9f)
       jumpHeight *= 1.15f;
@@ -1891,7 +1978,7 @@ void updatePlayer(float dt) {
         Mix_PlayChannel(-1, g_sfxJump, 0);
     }
   }
-  if (!(g_held & VPAD_BUTTON_B) && g_p.vy < -100)
+  if (!jumpHeld() && g_p.vy < -100)
     g_p.vy = -100;
 
   g_p.vy += (g_p.vy < 0 && g_p.jumping) ? Physics::JUMP_GRAVITY
@@ -1956,7 +2043,6 @@ void updatePlayer(float dt) {
         uint8_t col = collisionAt(tx, ty);
         if (col == COL_NONE)
           continue;
-        uint8_t tile = g_map[ty][tx];
         if (g_p.vy > 0) {
           if (col == COL_ONEWAY) {
             float prevBottom = (g_p.r.y - stepY) + g_p.r.h;
@@ -2175,18 +2261,18 @@ void updateEntities(float dt) {
         }
 
         if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32 &&
-            g_p.invT <= 0 && !g_p.dead && overlap(g_p.r, e.r)) {
+            !g_p.dead && overlap(g_p.r, e.r)) {
           if (playerStomp(e.r)) {
             e.state = 1;
             e.timer = 0;
-            g_p.vy = (g_held & VPAD_BUTTON_B) ? -Physics::BOUNCE_HEIGHT * 1.5f
-                                              : -Physics::BOUNCE_HEIGHT;
+            g_p.vy = jumpHeld() ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                : -Physics::BOUNCE_HEIGHT;
             g_p.score += 100;
             if (g_sfxStomp)
               Mix_PlayChannel(-1, g_sfxStomp, 0);
             else if (g_sfxKick)
               Mix_PlayChannel(-1, g_sfxKick, 0);
-          } else {
+          } else if (g_p.invT <= 0) {
             if (g_p.power > P_SMALL) {
               g_p.power = P_SMALL;
               g_p.crouch = false;
@@ -2245,11 +2331,11 @@ void updateEntities(float dt) {
       }
 
       if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32 &&
-          g_p.invT <= 0 && !g_p.dead && overlap(g_p.r, e.r)) {
+          !g_p.dead && overlap(g_p.r, e.r)) {
         bool stomp = playerStomp(e.r);
         if (stomp) {
-          g_p.vy = (g_held & VPAD_BUTTON_B) ? -Physics::BOUNCE_HEIGHT * 1.5f
-                                            : -Physics::BOUNCE_HEIGHT;
+          g_p.vy = jumpHeld() ? -Physics::BOUNCE_HEIGHT * 1.5f
+                              : -Physics::BOUNCE_HEIGHT;
           if (g_sfxStomp)
             Mix_PlayChannel(-1, g_sfxStomp, 0);
           else if (g_sfxKick)
@@ -2266,7 +2352,7 @@ void updateEntities(float dt) {
             e.timer = 0;
             e.dir = 0;
           }
-        } else {
+        } else if (g_p.invT <= 0) {
           if (e.state == 1) {
             e.state = 2;
             e.timer = 0;
@@ -2361,7 +2447,7 @@ void updateEntities(float dt) {
           Mix_PlayChannel(-1, g_sfxItemAppear, 0);
       }
     } else if (e.type == E_FIREBALL) {
-      const float speed = 140.0f;
+      const float speed = 200.0f;
       e.r.x += e.dir * speed * dt;
       e.vy += 260.0f * dt;
       e.r.y += e.vy * dt;
@@ -2379,7 +2465,7 @@ void updateEntities(float dt) {
           }
           if (col != COL_NONE) {
             e.r.y = bottomTy * TILE - e.r.h;
-            e.vy = -140.0f;
+            e.vy = -90.0f;
           }
         }
       }
@@ -2483,23 +2569,13 @@ void drawTile(int tx, int ty, uint8_t tile) {
     }
   }
 
-  auto drawBlockShadow = [&]() {
-    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 90);
-    SDL_Rect s = dst;
-    s.x += 2;
-    s.y += 2;
-    SDL_RenderFillRect(g_ren, &s);
-    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
-  };
-
   if (tile == T_COIN) {
     if (g_texCoin) {
       // Frame 0 of SpinningCoin.png is a solid green placeholder in the current
       // asset set, so skip it.
       int frame = 1 + ((SDL_GetTicks() / 120) % 3);
       SDL_Rect src = {frame * 16, 0, 16, 16};
-      SDL_RenderCopy(g_ren, g_texCoin, &src, &dst);
+      renderCopyWithShadow(g_texCoin, &src, &dst);
     } else {
       SDL_SetRenderDrawColor(g_ren, 255, 200, 0, 255);
       SDL_RenderFillRect(g_ren, &dst);
@@ -2508,17 +2584,15 @@ void drawTile(int tx, int ty, uint8_t tile) {
   }
 
   if (tile == T_QUESTION && g_texQuestion) {
-    drawBlockShadow();
     int frame = ((SDL_GetTicks() / 200) % 3);
     SDL_Rect src = {frame * 16, questionRowForTheme(g_theme), 16, 16};
-    SDL_RenderCopy(g_ren, g_texQuestion, &src, &dst);
+    renderCopyWithShadow(g_texQuestion, &src, &dst);
     return;
   }
   if (tile == T_USED && g_texQuestion) {
-    drawBlockShadow();
     // Use the dedicated "used" tile (check-mark) in the QuestionBlock sheet.
     SDL_Rect src = {2 * 16, questionRowForTheme(g_theme), 16, 16};
-    SDL_RenderCopy(g_ren, g_texQuestion, &src, &dst);
+    renderCopyWithShadow(g_texQuestion, &src, &dst);
     return;
   }
 
@@ -2536,7 +2610,7 @@ void drawTile(int tx, int ty, uint8_t tile) {
       else if (at == ATLAS_LIQUID)
         atlasTex = g_texLiquids ? g_texLiquids : g_texTerrain;
       if (atlasTex)
-        SDL_RenderCopy(g_ren, atlasTex, &src, &dst);
+        renderCopyWithShadow(atlasTex, &src, &dst);
       return;
     }
 
@@ -2555,7 +2629,6 @@ void drawTile(int tx, int ty, uint8_t tile) {
       src = {0, 0, 16, 16};
       break;
     case T_BRICK:
-      drawBlockShadow();
       src = {0, 64, 16, 16};
       break;
     case T_USED:
@@ -2579,7 +2652,7 @@ void drawTile(int tx, int ty, uint8_t tile) {
       break;
     }
     if (use) {
-      SDL_RenderCopy(g_ren, g_texTerrain, &src, &dst);
+      renderCopyWithShadow(g_texTerrain, &src, &dst);
       return;
     }
   }
@@ -2694,7 +2767,7 @@ void render() {
         for (int x = 0; x < GAME_W + 16; x += 16) {
           SDL_Rect dst = {x, groundY + row * 16, 16, 16};
           if (g_texTerrain)
-            SDL_RenderCopy(g_ren, g_texTerrain, &src, &dst);
+            renderCopyWithShadow(g_texTerrain, &src, &dst);
           else {
             SDL_SetRenderDrawColor(g_ren, 200, 76, 12, 255);
             SDL_RenderFillRect(g_ren, &dst);
@@ -2726,7 +2799,7 @@ void render() {
         if (i == g_mainMenuIndex && g_texMushroom) {
           SDL_Rect src = {0, 0, 16, 16};
           SDL_Rect dst = {x - 26, y + 2, 16, 16};
-          SDL_RenderCopy(g_ren, g_texMushroom, &src, &dst);
+          renderCopyWithShadow(g_texMushroom, &src, &dst);
         }
       }
       drawTextShadow(8, GAME_H - 18, "V1.0.1", 1, {255, 255, 255, 255});
@@ -2752,7 +2825,7 @@ void render() {
                         iconH};
         SDL_Rect src = {0, 0, 16, 16};
         if (g_texPlayerSmall[i])
-          SDL_RenderCopy(g_ren, g_texPlayerSmall[i], &src, &dst);
+          renderCopyWithShadow(g_texPlayerSmall[i], &src, &dst);
 
         SDL_Rect box = {x - 6, y - 6, 36, 36};
         SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
@@ -2922,7 +2995,7 @@ void render() {
 	        SDL_Rect src = {(int)cell.ax * 16, (int)cell.ay * 16, 16, 16};
 	        SDL_Rect dst = {baseX + cell.dx * TILE, (d.ty + cell.dy) * TILE, 16,
 	                        16};
-	        SDL_RenderCopy(g_ren, g_texDeco, &src, &dst);
+	        renderCopyWithShadow(g_texDeco, &src, &dst);
 	      }
 	    }
 	  }
@@ -2969,13 +3042,13 @@ void render() {
 	        SDL_QueryTexture(g_texFlagPole, nullptr, nullptr, &texW, &texH);
 	        SDL_Rect src = {0, 0, 16, texH};
 	        SDL_Rect dst = {poleX, poleBottom - texH, 16, texH};
-	        SDL_RenderCopy(g_ren, g_texFlagPole, &src, &dst);
+	        renderCopyWithShadow(g_texFlagPole, &src, &dst);
 	      }
 	      if (g_texFlag) {
 	        int frame = ((SDL_GetTicks() / 150) % 3);
 	        SDL_Rect src = {frame * 16, 0, 16, 16};
 	        SDL_Rect dst = {poleX - 16, (int)g_flagY, 16, 16};
-	        SDL_RenderCopy(g_ren, g_texFlag, &src, &dst);
+	        renderCopyWithShadow(g_texFlag, &src, &dst);
 	      }
 	    }
 
@@ -2986,7 +3059,7 @@ void render() {
 	      SDL_Rect srcTop = {0, 0, g_castleDrawDst.w, topH};
 	      SDL_Rect dstTop = g_castleDrawDst;
 	      dstTop.h = topH;
-	      SDL_RenderCopy(g_ren, g_texCastle, &srcTop, &dstTop);
+	      renderCopyWithShadow(g_texCastle, &srcTop, &dstTop);
 	    }
 
     // Entities
@@ -3007,7 +3080,7 @@ void render() {
             dst.h = 8;
             dst.y += 8;
           }
-          SDL_RenderCopy(g_ren, g_texGoomba, &src, &dst);
+          renderCopyWithShadow(g_texGoomba, &src, &dst);
         } else {
           SDL_SetRenderDrawColor(g_ren, 172, 100, 40, 255);
           SDL_RenderFillRect(g_ren, &dst);
@@ -3020,16 +3093,19 @@ void render() {
             if (g_texKoopaSheet) {
               int frame = (e.state == 2) ? ((int)(e.timer * 12) % 4) : 0;
               SDL_Rect src = {32 + frame * 16, 16, 16, 16};
-              SDL_RenderCopy(g_ren, g_texKoopaSheet, &src, &dst);
+              renderCopyWithShadow(g_texKoopaSheet, &src, &dst);
             } else if (g_texKoopa) {
               SDL_Rect src = {0, 8, 16, 16};
-              SDL_RenderCopy(g_ren, g_texKoopa, &src, &dst);
+              renderCopyWithShadow(g_texKoopa, &src, &dst);
             }
           } else {
             SDL_Rect src = {((int)(e.timer * 8) % 2) * 16, 0, 16, 24};
             SDL_RendererFlip flip =
                 (e.dir > 0) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
-            SDL_RenderCopyEx(g_ren, g_texKoopa, &src, &dst, 0, nullptr, flip);
+            SDL_Rect drawDst = dst;
+            drawDst.h = 24;
+            drawDst.y -= 8;
+            renderCopyExWithShadow(g_texKoopa, &src, &drawDst, flip);
           }
         } else {
           SDL_SetRenderDrawColor(g_ren, 0, 160, 0, 255);
@@ -3038,7 +3114,7 @@ void render() {
       } else if (e.type == E_MUSHROOM) {
         if (g_texMushroom) {
           SDL_Rect src = {0, 0, 16, 16};
-          SDL_RenderCopy(g_ren, g_texMushroom, &src, &dst);
+          renderCopyWithShadow(g_texMushroom, &src, &dst);
         } else {
           SDL_SetRenderDrawColor(g_ren, 220, 60, 60, 255);
           SDL_RenderFillRect(g_ren, &dst);
@@ -3047,24 +3123,28 @@ void render() {
         if (g_texFireFlower) {
           int frame = ((int)(e.timer * 12) % 4);
           SDL_Rect src = {frame * 16, fireFlowerRowForTheme(g_theme), 16, 16};
-          SDL_RenderCopy(g_ren, g_texFireFlower, &src, &dst);
+          renderCopyWithShadow(g_texFireFlower, &src, &dst);
         } else {
           SDL_SetRenderDrawColor(g_ren, 220, 140, 40, 255);
           SDL_RenderFillRect(g_ren, &dst);
         }
-	      } else if (e.type == E_FIREBALL) {
-	        if (g_texFireball) {
-	          SDL_Rect src = {0, 0, 16, 16};
-	          SDL_RenderCopy(g_ren, g_texFireball, &src, &dst);
-	        } else {
-	          SDL_SetRenderDrawColor(g_ren, 255, 120, 40, 255);
-	          SDL_RenderFillRect(g_ren, &dst);
+      } else if (e.type == E_FIREBALL) {
+        if (g_texFireball) {
+          SDL_Rect src = {0, 0, 8, 8};
+          SDL_Rect drawDst = {dst.x + 4, dst.y + 4, 8, 8};
+          SDL_Point center = {4, 4};
+          double angle = fmod(e.timer * 720.0, 360.0);
+          renderCopyExWithShadowAngle(g_texFireball, &src, &drawDst, angle,
+                                      SDL_FLIP_NONE, &center);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 255, 120, 40, 255);
+          SDL_RenderFillRect(g_ren, &dst);
         }
       } else if (e.type == E_COIN_POPUP) {
         if (g_texCoin) {
           int frame = 1 + ((int)(e.timer * 12) % 3);
           SDL_Rect src = {frame * 16, 0, 16, 16};
-          SDL_RenderCopy(g_ren, g_texCoin, &src, &dst);
+          renderCopyWithShadow(g_texCoin, &src, &dst);
         } else {
           SDL_SetRenderDrawColor(g_ren, 255, 200, 0, 255);
           SDL_RenderFillRect(g_ren, &dst);
@@ -3102,55 +3182,62 @@ void render() {
           Mix_PlayChannel(-1, g_sfxSkid, 0);
           g_skidCooldown = 0.35f;
         }
-	        int frame = 0;
-	        SDL_Rect src = {0, 0, 16, 16};
-	        if (g_p.power == P_SMALL) {
-	          if (!g_p.ground) {
-	            frame = 5;
-	          } else {
-	            frame = skidding ? 4
-	                             : (fabsf(g_p.vx) > 10
-	                                    ? 1 + ((int)(g_p.animT * 10) % 3)
-	                                    : 0);
-	          }
-	          src = {frame * 16, 0, 16, 16};
-	        } else if (g_p.power == P_FIRE) {
-	          int fireFrame = 0;
-	          if (g_p.throwT > 0.0f) {
-	            fireFrame = g_p.ground ? 7 : 8;
-	          } else if (g_p.crouch && g_p.ground) {
-	            fireFrame = 1;
-	          } else if (!g_p.ground) {
-	            fireFrame = 6;
-	          } else if (skidding) {
-	            fireFrame = 5;
-	          } else if (fabsf(g_p.vx) > 10) {
-	            fireFrame = 2 + ((int)(g_p.animT * 10) % 3);
-	          } else {
-	            fireFrame = 0;
-	          }
-	          src = firePlayerSrcForFrame(fireFrame);
-	        } else {
-	          // Big sheet: 0 idle, 1 crouch, 2..4 walk, 5 skid, 6 jump
-	          if (g_p.crouch && g_p.ground) {
-	            frame = 1;
-	          } else if (!g_p.ground) {
-	            frame = 6;
-	          } else {
-	            frame = skidding ? 5
-	                             : (fabsf(g_p.vx) > 10
-	                                    ? 2 + ((int)(g_p.animT * 10) % 3)
-	                                    : 0);
-	          }
-	          src = {frame * 16, 0, 16, 32};
-	        }
+        int frame = 0;
+        SDL_Rect src = {0, 0, 16, 16};
+        if (g_p.power == P_SMALL) {
+          if (!g_p.ground) {
+            frame = 5;
+          } else {
+            frame = skidding ? 4
+                             : (fabsf(g_p.vx) > 10
+                                    ? 1 + ((int)(g_p.animT * 10) % 3)
+                                    : 0);
+          }
+          src = {frame * 16, 0, 16, 16};
+        } else if (g_p.power == P_FIRE) {
+          int fireFrame = 0;
+          if (g_p.throwT > 0.0f) {
+            fireFrame = g_p.ground ? 7 : 8;
+          } else if (g_p.crouch && g_p.ground) {
+            fireFrame = 1;
+          } else if (!g_p.ground) {
+            fireFrame = 6;
+          } else if (skidding) {
+            fireFrame = 5;
+          } else if (fabsf(g_p.vx) > 10) {
+            fireFrame = 2 + ((int)(g_p.animT * 10) % 3);
+          } else {
+            fireFrame = 0;
+          }
+          frame = fireFrame;
+          src = {frame * 16, 0, 16, 32};
+        } else {
+          // Big sheet: 0 idle, 1 crouch, 2..4 walk, 5 skid, 6 jump
+          if (g_p.crouch && g_p.ground) {
+            frame = 1;
+          } else if (!g_p.ground) {
+            frame = 6;
+          } else {
+            frame = skidding ? 5
+                             : (fabsf(g_p.vx) > 10
+                                    ? 2 + ((int)(g_p.animT * 10) % 3)
+                                    : 0);
+          }
+          src = {frame * 16, 0, 16, 32};
+        }
 
         SDL_RendererFlip flip = g_p.right ? SDL_FLIP_NONE : SDL_FLIP_HORIZONTAL;
-	        SDL_RenderCopyEx(g_ren, tex, &src, &dst, 0, nullptr, flip);
-	      } else {
-	        // Fallback rectangle if texture missing
-	        SDL_SetRenderDrawColor(g_ren, 228, 52, 52, 255);
-	        SDL_RenderFillRect(g_ren, &dst);
+        if (g_p.power == P_SMALL) {
+          renderCopyExWithShadow(tex, &src, &dst, flip);
+        } else {
+          // Some backends behave oddly with a single 16x32 blit (showing only the
+          // top half). Split tall sprites into two 16x16 draws.
+          renderTall16x32WithShadow(tex, frame * 16, dst, flip);
+        }
+      } else {
+		        // Fallback rectangle if texture missing
+		        SDL_SetRenderDrawColor(g_ren, 228, 52, 52, 255);
+		        SDL_RenderFillRect(g_ren, &dst);
 	      }
 	    }
 	    // Castle overlay: hides the player as they enter the door.

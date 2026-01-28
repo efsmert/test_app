@@ -476,26 +476,33 @@ def build_character_sheets(output_dir: Path) -> None:
         return (max_w, max_h)
 
     def bake_frame(
-        frame: Image.Image, cw: int, ch: int, scale_h: int
+        frame: Image.Image, cw: int, ch: int, scale_x: float, scale_y: float
     ) -> Image.Image:
+        """
+        Convert a Remastered frame into a fixed-size NES-ish canvas.
+
+        Approach:
+        - Trim fully transparent padding (bbox).
+        - Scale by the sheet's baseline (scale_x/scale_y) so big/small stay
+          consistent, while shorter frames (crouch) remain shorter.
+        - Bottom-align (feet), center horizontally.
+        """
         bbox = frame.getbbox()
         if not bbox:
             return Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         frame = frame.crop(bbox)
-        # Scale to consistently fill the target height, then crop width if
-        # needed. This avoids "short" big characters (e.g. Luigi/Toadette)
-        # caused by rare wide frames forcing an overly small uniform scale.
-        scale = ch / scale_h
-        nw = max(1, int(round(frame.width * scale)))
-        nh = max(1, int(round(frame.height * scale)))
+
+        nw = max(1, int(round(frame.width * scale_x)))
+        nh = max(1, int(round(frame.height * scale_y)))
         resized = frame.resize((nw, nh), Image.NEAREST)
-        if resized.height > ch:
-            # Keep feet (bottom) aligned.
-            resized = resized.crop((0, resized.height - ch, resized.width, resized.height))
+
+        # If rounding made it spill by 1px, crop conservatively.
         if resized.width > cw:
-            # Center-crop horizontally (keeps the sprite feeling centered).
             left = (resized.width - cw) // 2
             resized = resized.crop((left, 0, left + cw, resized.height))
+        if resized.height > ch:
+            resized = resized.crop((0, resized.height - ch, resized.width, resized.height))
+
         canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         ox = (cw - resized.width) // 2
         oy = ch - resized.height
@@ -523,19 +530,28 @@ def build_character_sheets(output_dir: Path) -> None:
         small_order = small_anim_order(src_small_json)
         big_order = big_anim_order(src_big_json)
 
-        _, small_max_h = union_bbox(img_small, small_order)
+        small_max_w, small_max_h = union_bbox(img_small, small_order)
+        small_sx = 16 / small_max_w
+        small_sy = 16 / small_max_h
         sheet_small = Image.new("RGBA", (16 * len(small_order), 16), (0, 0, 0, 0))
         for i, (x, y, w, h) in enumerate(small_order):
             frame = img_small.crop((x, y, x + w, y + h))
-            frame = bake_frame(frame, 16, 16, small_max_h)
+            frame = bake_frame(frame, 16, 16, small_sx, small_sy)
             sheet_small.paste(frame, (i * 16, 0))
         sheet_small.save(out_dir / "Small.png")
 
+        # Big sheets: downscale Remastered Big frames into a fixed 16x32 strip.
+        # Use a uniform scale based on the tallest frame so proportions stay
+        # consistent (avoid a "thin stretched small" look).
         _, big_max_h = union_bbox(img_big, big_order)
-        sheet_big = Image.new("RGBA", (16 * len(big_order), 32), (0, 0, 0, 0))
+        big_scale = 32 / big_max_h
+        # Some render backends/drivers are picky about texture widths that aren't
+        # aligned; pad Big to 8 frames (128px wide) while still using only the
+        # first 7 frames worth of data.
+        sheet_big = Image.new("RGBA", (16 * 8, 32), (0, 0, 0, 0))
         for i, (x, y, w, h) in enumerate(big_order):
             frame = img_big.crop((x, y, x + w, y + h))
-            frame = bake_frame(frame, 16, 32, big_max_h)
+            frame = bake_frame(frame, 16, 32, big_scale, big_scale)
             sheet_big.paste(frame, (i * 16, 0))
         sheet_big.save(out_dir / "Big.png")
 
@@ -543,11 +559,13 @@ def build_character_sheets(output_dir: Path) -> None:
         if src_fire.exists() and src_fire_json.exists():
             img_fire = Image.open(src_fire).convert("RGBA")
             fire_order = fire_anim_order(src_fire_json)
-            _, fire_max_h = union_bbox(img_fire, fire_order)
+            fire_max_w, fire_max_h = union_bbox(img_fire, fire_order)
+            fire_sx = 16 / fire_max_w
+            fire_sy = 32 / fire_max_h
             sheet_fire = Image.new("RGBA", (16 * len(fire_order), 32), (0, 0, 0, 0))
             for i, (x, y, w, h) in enumerate(fire_order):
                 frame = img_fire.crop((x, y, x + w, y + h))
-                frame = bake_frame(frame, 16, 32, fire_max_h)
+                frame = bake_frame(frame, 16, 32, fire_sx, fire_sy)
                 sheet_fire.paste(frame, (i * 16, 0))
             sheet_fire.save(out_dir / "Fire.png")
 
