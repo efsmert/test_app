@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import subprocess
+import shutil
 from pathlib import Path
 
 from PIL import Image
@@ -181,7 +182,12 @@ def draw_tile_chroma_key(
             px = dst_x + tx
             py = dst_y + ty
             if 0 <= px < img.width and 0 <= py < img.height:
-                if img.getpixel((px, py)) == OPAQUE_GREEN:
+                # Remastered templates use bright-green as a "paint here" mask.
+                # Some templates encode that mask as transparent green
+                # (0,255,0,0) rather than opaque green (0,255,0,255), so match
+                # by RGB only.
+                r, g, b, _a = img.getpixel((px, py))
+                if (r, g, b) == (0, 255, 0):
                     img.putpixel((px, py), palette[ci])
 
 
@@ -281,25 +287,71 @@ def extract_smb_assets(rom_path: Path, output_dir: Path) -> None:
 
     rem = remastered_root()
 
-    # Mario Small (render full 256x96, then crop the 6-frame strip used by the Wii U port)
+    # Mario Small (render full 256x96, then extract the 6-frame NES strip used by the Wii U port)
     mario_small_full = render_from_remastered_spec(
         chr_rom,
         rem / "Assets/Sprites/Players/Mario/Small.png",
         rem / "Resources/AssetRipper/Sprites/Players/Mario/Small.json",
     )
-    mario_small = mario_small_full.crop((0, 16, 96, 32))
+    # The AssetRipper output is laid out in 32x16 cells; the actual sprite lives
+    # in the centered 16px region of each cell (x=8..24).
+    mario_small = Image.new("RGBA", (16 * 6, 16), (0, 0, 0, 0))
+    for i in range(6):
+        cell = mario_small_full.crop((i * 32, 16, i * 32 + 32, 32))
+        frame = cell.crop((8, 0, 24, 16))
+        mario_small.paste(frame, (i * 16, 0))
     mario_small.save(output_dir / "sprites/mario/Small.png")
     print("Created: sprites/mario/Small.png")
 
-    # Mario Big (crop 96x32 from top)
+    # Mario Big (extract 7-frame strip + pad to 8 frames (128px) for renderer quirks)
     mario_big_full = render_from_remastered_spec(
         chr_rom,
         rem / "Assets/Sprites/Players/Mario/Big.png",
         rem / "Resources/AssetRipper/Sprites/Players/Mario/Big.json",
     )
-    mario_big = mario_big_full.crop((0, 0, 96, 32))
+    # Order in this port: Idle, Crouch, Walk(3), Skid, Jump.
+    mario_big = Image.new("RGBA", (16 * 8, 32), (0, 0, 0, 0))
+    for i in range(7):
+        cell = mario_big_full.crop((i * 32, 0, i * 32 + 32, 32))
+        frame = cell.crop((8, 0, 24, 32))
+        mario_big.paste(frame, (i * 16, 0))
     mario_big.save(output_dir / "sprites/mario/Big.png")
     print("Created: sprites/mario/Big.png")
+
+    # The Wii U port loads character sheets from `sprites/players/<Name>/...`.
+    # Mario is special: we use ROM-derived SMB1 sprites for him.
+    mario_out_dir = output_dir / "sprites/players" / "Mario"
+    mario_out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(output_dir / "sprites/mario/Small.png", mario_out_dir / "Small.png")
+    shutil.copyfile(output_dir / "sprites/mario/Big.png", mario_out_dir / "Big.png")
+
+    # Synthesize a simple Fire sheet from Big by palette swapping.
+    # Fire order in this port: Idle, Crouch, Move(3), Skid, Jump, Attack, AirAttack.
+    def fire_palette_swap(img: Image.Image) -> Image.Image:
+        src = img.convert("RGBA")
+        data = []
+        for r, g, b, a in src.getdata():
+            if a == 0:
+                data.append((0, 0, 0, 0))
+                continue
+            if (r, g, b) == (247, 57, 16):  # red -> white
+                data.append((255, 255, 255, a))
+            elif (r, g, b) == (140, 115, 24):  # outline -> red
+                data.append((247, 57, 16, a))
+            else:
+                data.append((r, g, b, a))
+        out = Image.new("RGBA", src.size, (0, 0, 0, 0))
+        out.putdata(data)
+        return out
+
+    fire_sheet = Image.new("RGBA", (16 * 9, 32), (0, 0, 0, 0))
+    big_frames = Image.open(output_dir / "sprites/mario/Big.png").convert("RGBA")
+    # Source Big frames are 7-wide: [Idle, Crouch, Walk1, Walk2, Walk3, Skid, Jump]
+    mapping = [0, 1, 2, 3, 4, 5, 6, 0, 6]
+    for out_i, src_i in enumerate(mapping):
+        frame = big_frames.crop((src_i * 16, 0, (src_i + 1) * 16, 32))
+        fire_sheet.paste(fire_palette_swap(frame), (out_i * 16, 0))
+    fire_sheet.save(mario_out_dir / "Fire.png")
 
     # Goomba (top-left block is the default palette)
     goomba_full = render_from_remastered_spec(
@@ -317,9 +369,15 @@ def extract_smb_assets(rom_path: Path, output_dir: Path) -> None:
         rem / "Assets/Sprites/Enemies/KoopaTroopa.png",
         rem / "Resources/AssetRipper/Sprites/Enemies/KoopaTroopa.json",
     )
-    koopa_2frames = koopa_full.crop((0, 0, 96, 32)).crop((0, 8, 32, 32))
+    koopa_cell = koopa_full.crop((0, 0, 96, 32))
+    koopa_2frames = koopa_cell.crop((0, 8, 32, 32))
     koopa_2frames.save(output_dir / "sprites/enemies/KoopaTroopa.png")
     print("Created: sprites/enemies/KoopaTroopa.png")
+
+    # KoopaTroopaSheet (shell frames). The Wii U runtime expects shell frames at:
+    #   x=32..96, y=16..32 (4x 16x16 frames) in the *first* (default) 96x32 cell.
+    koopa_cell.save(output_dir / "sprites/enemies/KoopaTroopaSheet.png")
+    print("Created: sprites/enemies/KoopaTroopaSheet.png")
 
     # Super Mushroom (crop to 16x16)
     mushroom_full = render_from_remastered_spec(
@@ -341,6 +399,9 @@ def extract_smb_assets(rom_path: Path, output_dir: Path) -> None:
     fireball.save(output_dir / "sprites/items/Fireball.png")
     print("Created: sprites/items/Fireball.png")
 
+    # NOTE: Other characters ship with curated sheets in the repo; keep this
+    # extractor focused on ROM-derived assets to avoid overwriting them.
+
     # Question Block
     # Keep the full sheet so theme rows (Underground/Castle/Snow/etc) remain
     # available for rendering.
@@ -361,8 +422,11 @@ def extract_smb_assets(rom_path: Path, output_dir: Path) -> None:
     coin_icon_full.save(output_dir / "sprites/ui/CoinIcon.png")
     print("Created: sprites/ui/CoinIcon.png")
 
-    build_character_sheets(output_dir)
+    # Keep curated `content/sprites/players/*` sheets intact. (Mario is handled
+    # explicitly above via ROM-derived sprites.)
     copy_ui_assets(output_dir)
+    copy_particle_assets(output_dir)
+    extract_tileset_sprites(chr_rom, output_dir)
 
     # Generate C++ level data from the Godot project (SMB1 scenes).
     tools_script = Path(__file__).resolve().parent / "tools/godot_levels_to_cpp.py"
@@ -407,6 +471,30 @@ def extract_tilesets(rom_path: Path, output_dir: Path) -> None:
 
     print(f"Tilesets written to: {tilesets_out}")
     print(f"Tilesets rendered: {rendered}, copied: {copied}")
+
+
+def extract_tileset_sprites(chr_rom: bytes, output_dir: Path) -> None:
+    """
+    Render a small subset of Tilesets sprites that the Wii U runtime loads from
+    `content/sprites/tilesets/*.png` (distinct from the `content/tilesets/*`
+    terrain atlases).
+    """
+    rem = remastered_root()
+    src_root = rem / "Assets/Sprites/Tilesets"
+    spec_root = rem / "Resources/AssetRipper/Sprites/Tilesets"
+    dst_root = output_dir / "sprites/tilesets"
+    dst_root.mkdir(parents=True, exist_ok=True)
+
+    for name in ["Flag.png", "FlagPole.png", "EndingCastleSprite.png"]:
+        template_path = src_root / name
+        if not template_path.exists():
+            continue
+        spec_path = spec_root / Path(name).with_suffix(".json")
+        if spec_path.exists():
+            img = render_from_remastered_spec(chr_rom, template_path, spec_path)
+        else:
+            img = Image.open(template_path).convert("RGBA")
+        img.save(dst_root / name)
 
 
 def load_anim_rects(json_path: Path, anim_name: str) -> list[list[int]]:
@@ -587,6 +675,25 @@ def copy_ui_assets(output_dir: Path) -> None:
         p = ui_src / name
         if p.exists():
             Image.open(p).convert("RGBA").save(ui_dst / name)
+
+
+def copy_particle_assets(output_dir: Path) -> None:
+    """
+    Copy lightweight ambient particle textures used by the Wii U port.
+
+    Upstream Godot uses these via LevelBG (CPUParticles2D):
+    - Snow (8x8)
+    - Leaves / AutumnLeaves (2-frame 16x8 sheet)
+    """
+    rem = remastered_root()
+    src_dir = rem / "Assets/Sprites/Particles"
+    dst_dir = output_dir / "sprites/particles"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in ["Snow.png", "Leaves.png", "AutumnLeaves.png"]:
+        p = src_dir / name
+        if p.exists():
+            Image.open(p).convert("RGBA").save(dst_dir / name)
 
 
 def main(argv: list[str]) -> int:

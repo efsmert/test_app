@@ -54,9 +54,14 @@ class Node:
     target_sub_level: int | None
     enter_direction: int | None
     connecting_pipe: str | None
+    vertical_direction: int | None
+    top: int | None
+    linked_platform: str | None
+    rope_top: int | None
     bg_primary_layer: int | None
     bg_second_layer: int | None
     bg_overlay_clouds: bool | None
+    bg_particles: int | None
 
 
 def parse_uid_map() -> dict[str, Path]:
@@ -103,9 +108,14 @@ def parse_nodes(lines: list[str], ext: dict[str, str]) -> list[Node]:
                 target_sub_level=None,
                 enter_direction=None,
                 connecting_pipe=None,
+                vertical_direction=None,
+                top=None,
+                linked_platform=None,
+                rope_top=None,
                 bg_primary_layer=None,
                 bg_second_layer=None,
                 bg_overlay_clouds=None,
+                bg_particles=None,
             )
             nodes.append(cur)
             continue
@@ -118,7 +128,10 @@ def parse_nodes(lines: list[str], ext: dict[str, str]) -> list[Node]:
             if m:
                 cur.position = (float(m.group(1)), float(m.group(2)))
         elif line.startswith("tile_map_data = PackedByteArray"):
-            if cur.name == "Tiles":
+            # Levels commonly use multiple TileMap layers (e.g. `Tiles` and
+            # `DecoTiles`). Capture tile_map_data for any TileMap node so
+            # decorations can be preserved.
+            if cur.name in ("Tiles", "DecoTiles"):
                 m = re.search(r'PackedByteArray\("([^"]+)"\)', line)
                 if m:
                     cur.tile_map_data = m.group(1)
@@ -137,6 +150,25 @@ def parse_nodes(lines: list[str], ext: dict[str, str]) -> list[Node]:
             m = re.search(r'NodePath\("([^"]+)"\)', line)
             if m:
                 cur.connecting_pipe = m.group(1).split("/")[-1]
+        elif line.startswith("linked_platform = "):
+            m = re.search(r'NodePath\("([^"]+)"\)', line)
+            if m:
+                cur.linked_platform = m.group(1).split("/")[-1]
+        elif line.startswith("vertical_direction = "):
+            try:
+                cur.vertical_direction = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("top = "):
+            try:
+                cur.top = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("rope_top = "):
+            try:
+                cur.rope_top = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
         elif line.startswith("primary_layer = "):
             try:
                 cur.bg_primary_layer = int(line.split("=", 1)[1].strip())
@@ -149,6 +181,11 @@ def parse_nodes(lines: list[str], ext: dict[str, str]) -> list[Node]:
                 pass
         elif line.startswith("overlay_clouds = "):
             cur.bg_overlay_clouds = line.split("=", 1)[1].strip().lower() == "true"
+        elif line.startswith("particles = "):
+            try:
+                cur.bg_particles = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
 
     return nodes
 
@@ -192,6 +229,22 @@ def merge_nodes(base_nodes: list[Node], override_nodes: list[Node]) -> list[Node
                 b.enter_direction = o.enter_direction
             if o.connecting_pipe is not None:
                 b.connecting_pipe = o.connecting_pipe
+            if o.vertical_direction is not None:
+                b.vertical_direction = o.vertical_direction
+            if o.top is not None:
+                b.top = o.top
+            if o.linked_platform is not None:
+                b.linked_platform = o.linked_platform
+            if o.rope_top is not None:
+                b.rope_top = o.rope_top
+            if o.bg_primary_layer is not None:
+                b.bg_primary_layer = o.bg_primary_layer
+            if o.bg_second_layer is not None:
+                b.bg_second_layer = o.bg_second_layer
+            if o.bg_overlay_clouds is not None:
+                b.bg_overlay_clouds = o.bg_overlay_clouds
+            if o.bg_particles is not None:
+                b.bg_particles = o.bg_particles
         else:
             index_by_key[key] = len(merged)
             merged.append(o)
@@ -414,11 +467,41 @@ def to_tile(pos: tuple[float, float], x_offset: int, y_offset: int) -> tuple[int
     return tx, ty
 
 
+def to_world_px(pos: tuple[float, float], x_offset: int, y_offset: int) -> tuple[float, float]:
+    # Convert Godot world pixels into our world pixels by applying the same
+    # tile-map offsets used for `to_tile`. This keeps instanced non-tile objects
+    # (platforms, generators, etc.) aligned with the exported map.
+    return (pos[0] + x_offset * TILE, pos[1] + y_offset * TILE)
+
+
 def build_levels():
     uid_map = parse_uid_map()
     scene_source_index, scene_map = parse_tileset_scene_map()
     source_kind, collision_by_source = parse_tileset_atlas_kinds_and_collision()
     terrain_source = next((k for k, v in sorted(source_kind.items()) if v == ATLAS_TERRAIN), 0)
+
+    def compute_bottom_terrain_y(
+        cells: list[tuple[int, int, int, int, int, int]],
+        fallback: int,
+    ) -> int:
+        # Some levels contain a handful of outlier terrain tiles far below the
+        # playable area (e.g. editor artifacts). Using the absolute max Y would
+        # shift the whole stage up into the ceiling. Instead, find the bottom
+        # "dominant" terrain row by filtering out very-low-frequency rows.
+        from collections import Counter
+
+        ys = [c[1] for c in cells if source_kind.get(c[2], ATLAS_NONE) == ATLAS_TERRAIN]
+        if not ys:
+            return fallback
+        counts = Counter(ys)
+        maxc = max(counts.values())
+        # Keep rows that have at least ~12.5% of the density of the most common
+        # terrain row (and at least a few tiles).
+        thresh = max(3, maxc // 8)
+        candidates = [y for y, cnt in counts.items() if cnt >= thresh]
+        if not candidates:
+            return max(ys)
+        return max(candidates)
 
     level_files = sorted(LEVELS_ROOT.rglob("*.tscn"))
     sections = []
@@ -434,22 +517,40 @@ def build_levels():
                     music_path = ext[m.group(1)]
                 break
 
-        tile_node = next((n for n in nodes if n.tile_map_data), None)
-        if not tile_node:
-            continue
-        cells = decode_tile_map_data(tile_node.tile_map_data or "")
-        if not cells:
+        # Levels use multiple TileMap layers. Critically, the "Tiles" layer and
+        # "DecoTiles" layer reference different TileSets (different source ids),
+        # so we must preserve which TileMap a cell came from.
+        tile_nodes = [n for n in nodes if n.tile_map_data]
+        if not tile_nodes:
             continue
 
-        xs = [c[0] for c in cells]
-        ys = [c[1] for c in cells]
+        tile_layers: list[tuple[bool, list[tuple[int, int, int, int, int, int]]]] = []
+        all_cells: list[tuple[int, int, int, int, int, int]] = []
+        terrain_cells: list[tuple[int, int, int, int, int, int]] = []
+        for tn in tile_nodes:
+            decoded = decode_tile_map_data(tn.tile_map_data or "")
+            if not decoded:
+                continue
+            is_deco_layer = tn.name == "DecoTiles"
+            tile_layers.append((is_deco_layer, decoded))
+            all_cells.extend(decoded)
+            if not is_deco_layer:
+                terrain_cells.extend(decoded)
+
+        if not all_cells:
+            continue
+
+        xs = [c[0] for c in all_cells]
+        ys = [c[1] for c in all_cells]
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
-        width = max_x - min_x + 1
+        map_width_tiles = max_x - min_x + 1
         x_offset = -min_x
         # Shift so the second-to-last terrain row becomes the bottom row after
         # dropping the lowest terrain layer.
-        y_offset = MAP_H - max_y
+        terrain_for_bottom = terrain_cells if terrain_cells else all_cells
+        max_y_terrain = compute_bottom_terrain_y(terrain_for_bottom, max_y)
+        y_offset = MAP_H - max_y_terrain
 
         # base map
         grid = [[0 for _ in range(MAP_W)] for _ in range(MAP_H)]
@@ -458,15 +559,22 @@ def build_levels():
         atlas_y = [[255 for _ in range(MAP_W)] for _ in range(MAP_H)]
         collide = [[COL_NONE for _ in range(MAP_W)] for _ in range(MAP_H)]
         qmeta = [[0 for _ in range(MAP_W)] for _ in range(MAP_H)]
-        for x, y, source, ax, ay, _alt in cells:
-            # The SMB1 terrain set encodes base ground as three stacked rows at
-            # the bottom. To match the classic two-row ground thickness, drop
-            # the lowest of those three rows.
-            if source == terrain_source and y == max_y:
-                continue
-            tx = x + x_offset
-            ty = y + y_offset
-            if 0 <= tx < MAP_W and 0 <= ty < MAP_H:
+        # Apply terrain/scene first, then apply DecoTiles (never overwriting
+        # gameplay tiles).
+        tile_layers.sort(key=lambda it: 1 if it[0] else 0)
+        for is_deco_layer, layer_cells in tile_layers:
+            for x, y, source, ax, ay, _alt in layer_cells:
+                # The SMB1 terrain set encodes base ground as three stacked rows
+                # at the bottom. To match the classic two-row ground thickness,
+                # drop the lowest of those three rows (terrain layer only).
+                if (not is_deco_layer) and source_kind.get(source, ATLAS_NONE) == ATLAS_TERRAIN and y == max_y_terrain:
+                    continue
+
+                tx = x + x_offset
+                ty = y + y_offset
+                if not (0 <= tx < MAP_W and 0 <= ty < MAP_H):
+                    continue
+
                 if source == scene_source_index:
                     # Scene tiles (blocks, etc.) - map to gameplay tiles.
                     scene_id = _alt if _alt > 0 else (ax + 1)
@@ -495,22 +603,47 @@ def build_levels():
                     atlas_t[ty][tx] = ATLAS_NONE
                     atlas_x[ty][tx] = 255
                     atlas_y[ty][tx] = 255
-                else:
-                    kind = source_kind.get(source, ATLAS_NONE)
-                    if kind == ATLAS_NONE:
+                    continue
+
+                if is_deco_layer:
+                    # The DecoTiles TileMap is always decorative and should
+                    # never block the player.
+                    if grid[ty][tx] != 0:
+                        continue
+                    if atlas_x[ty][tx] != 255 or atlas_y[ty][tx] != 255:
                         continue
                     grid[ty][tx] = 255
-                    atlas_t[ty][tx] = kind
+                    atlas_t[ty][tx] = ATLAS_DECO
                     atlas_x[ty][tx] = ax & 0xFF
                     atlas_y[ty][tx] = ay & 0xFF
-                    collide[ty][tx] = collision_by_source.get(
-                        (source, ax & 0xFF, ay & 0xFF), COL_NONE
-                    )
+                    collide[ty][tx] = COL_NONE
+                    continue
+
+                kind = source_kind.get(source, ATLAS_NONE)
+                if kind == ATLAS_NONE:
+                    continue
+                # Never let atlas-deco tiles overwrite terrain/scene tiles at
+                # the same coordinate.
+                if kind == ATLAS_DECO:
+                    if grid[ty][tx] != 0:
+                        continue
+                    if atlas_x[ty][tx] != 255 or atlas_y[ty][tx] != 255:
+                        continue
+                grid[ty][tx] = 255
+                atlas_t[ty][tx] = kind
+                atlas_x[ty][tx] = ax & 0xFF
+                atlas_y[ty][tx] = ay & 0xFF
+                collide[ty][tx] = collision_by_source.get(
+                    (source, ax & 0xFF, ay & 0xFF), COL_NONE
+                )
 
         # node-driven overlays / metadata
         pipes_entry = []
         pipes_exit: dict[int, tuple[int, int]] = {}
         pipe_pos_by_name: dict[str, tuple[int, int]] = {}
+        # Enemy / object spawns (including moving platforms + generators).
+        # Tuple layout matches `EnemySpawn`:
+        #   (etype, x_px, y_px, dir, a, b)
         enemies = []
         flag_x = 0
         has_flag = False
@@ -519,6 +652,8 @@ def build_levels():
         bg_primary = 0
         bg_secondary = 0
         bg_clouds = False
+        bg_particles = 0
+        rope_platform_nodes: dict[str, tuple[float, float, int, str | None, int | None]] = {}
 
         for n in nodes:
             if not n.resource_path:
@@ -531,8 +666,24 @@ def build_levels():
                 bg_primary = n.bg_primary_layer or 0
                 bg_secondary = n.bg_second_layer or 0
                 bg_clouds = bool(n.bg_overlay_clouds)
+                bg_particles = n.bg_particles or 0
                 continue
             if n.position is None:
+                continue
+
+            # Rope elevator platforms are paired objects linked via NodePath.
+            # Export them after scanning the whole scene so we can assign stable
+            # pair ids.
+            if "RopeElevatorPlatform.tscn" in res:
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                plat_w = 32 if "SmallRopeElevatorPlatform.tscn" in res else 48
+                rope_platform_nodes[n.name] = (
+                    wx,
+                    wy,
+                    plat_w,
+                    n.linked_platform,
+                    n.rope_top,
+                )
                 continue
             if "Player.tscn" in res:
                 spawn_pos = n.position
@@ -545,10 +696,60 @@ def build_levels():
 
             if "Goomba.tscn" in res:
                 tx, ty = to_tile(n.position, x_offset, y_offset)
-                enemies.append(("E_GOOMBA", tx * TILE, (ty - 1) * TILE, -1))
+                enemies.append(("E_GOOMBA", tx * TILE, (ty - 1) * TILE, -1, 0, 0))
             if "KoopaTroopa.tscn" in res:
                 tx, ty = to_tile(n.position, x_offset, y_offset)
-                enemies.append(("E_KOOPA", tx * TILE, (ty - 1) * TILE, -1))
+                et = "E_KOOPA_RED" if "RedKoopaTroopa.tscn" in res else "E_KOOPA"
+                enemies.append((et, tx * TILE, (ty - 1) * TILE, -1, 0, 0))
+
+            if "CheepCheep.tscn" in res:
+                # Underwater Cheep-Cheeps (Green/Red).
+                tx, ty = to_tile(n.position, x_offset, y_offset)
+                enemies.append(("E_CHEEP_SWIM", tx * TILE, (ty - 1) * TILE, -1, 0, 0))
+
+            # Moving platforms (instanced scenes, not TileMap tiles).
+            if "SidewaysPlatform.tscn" in res:
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                plat_w = 32 if "SmallSidewaysPlatform.tscn" in res else 48
+                enemies.append(("E_PLATFORM_SIDEWAYS", wx - plat_w / 2, wy, 0, plat_w, 0))
+            if "VerticalPlatform.tscn" in res:
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                plat_w = 32 if "SmallVerticalPlatform.tscn" in res else 48
+                enemies.append(("E_PLATFORM_VERTICAL", wx - plat_w / 2, wy, 0, plat_w, 0))
+
+            # Classic SMB elevators in 1-2 (wrap between top..bottom).
+            if "ElevatorPlatform.tscn" in res:
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                vertical_dir = n.vertical_direction if n.vertical_direction is not None else 1
+                top = n.top
+                if top is None:
+                    # Defaults from the upstream scenes/scripts.
+                    if "SmallElevatorPlatform.tscn" in res or "MediumElevatorPlatform.tscn" in res:
+                        top = -176
+                    else:
+                        top = -244
+                top_world = int(top + y_offset * TILE)
+                bottom_world = int(64 + y_offset * TILE)
+                enemies.append(("E_PLATFORM_VERTICAL", wx - 24, wy, vertical_dir, top_world, bottom_world))
+
+            # Off-screen generators / stoppers (EntityGenerator).
+            if res.endswith("CheepCheepGenerator.tscn"):
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                enemies.append(("E_ENTITY_GENERATOR", wx, wy, 1, "E_CHEEP_LEAP", 1000))
+            if res.endswith("BulletBillGenerator.tscn"):
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                enemies.append(("E_ENTITY_GENERATOR", wx, wy, 0, "E_BULLET_BILL", 2000))
+            if res.endswith("EntityGeneratorStopper.tscn"):
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                enemies.append(("E_ENTITY_GENERATOR_STOP", wx, wy, 0, 0, 0))
+
+            # Castle completion (axe) + Bowser.
+            if res.endswith("CastleBridge.tscn"):
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                enemies.append(("E_CASTLE_AXE", wx + 208, wy - 32, 0, 0, 0))
+            if res.endswith("Bowser.tscn"):
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                enemies.append(("E_BOWSER", wx, wy, -1, 0, 0))
 
             if "BrickBlock" in res:
                 tx, ty = to_tile(n.position, x_offset, y_offset)
@@ -614,6 +815,27 @@ def build_levels():
                                 "enter_dir": n.enter_direction if n.enter_direction is not None else 0,
                             }
                         )
+
+        # Export RopeElevatorPlatform pairs now that we've seen all nodes.
+        if rope_platform_nodes:
+            pair_id = 1
+            assigned: dict[str, int] = {}
+            for name, (_wx, _wy, _w, linked, _rope_top) in rope_platform_nodes.items():
+                if name in assigned:
+                    continue
+                pid = pair_id
+                pair_id += 1
+                assigned[name] = pid
+                if linked and linked in rope_platform_nodes:
+                    assigned[linked] = pid
+
+            for name, (wx, wy, width, _linked, rope_top) in rope_platform_nodes.items():
+                pid = assigned.get(name, 0)
+                if pid == 0:
+                    continue
+                top = rope_top if rope_top is not None else -160
+                top_world = int(top + y_offset * TILE)
+                enemies.append(("E_PLATFORM_ROPE", wx - width / 2, wy, pid, width, top_world))
 
         # castle stamp
         if castle_pos:
@@ -688,7 +910,7 @@ def build_levels():
                 "atlas_y": atlas_y,
                 "collide": collide,
                 "qmeta": qmeta,
-                "map_width": min(width, MAP_W),
+                "map_width": min(map_width_tiles, MAP_W),
                 "map_height": MAP_H,
                 "theme": theme,
                 "flag_x": flag_x,
@@ -696,6 +918,7 @@ def build_levels():
                 "bg_primary": bg_primary,
                 "bg_secondary": bg_secondary,
                 "bg_clouds": bg_clouds,
+                "bg_particles": bg_particles,
                 "pipes_entry": pipes_entry,
                 "pipes_exit": pipes_exit,
                 "pipe_pos_by_name": pipe_pos_by_name,
@@ -739,7 +962,8 @@ def build_levels():
         min_y, max_y = min(ys), max(ys)
         width = max_x - min_x + 1
         x_offset = -min_x
-        y_offset = MAP_H - max_y
+        max_y_terrain = compute_bottom_terrain_y(cells, max_y)
+        y_offset = MAP_H - max_y_terrain
 
         grid = [[0 for _ in range(MAP_W)] for _ in range(MAP_H)]
         atlas_t = [[ATLAS_NONE for _ in range(MAP_W)] for _ in range(MAP_H)]
@@ -749,7 +973,7 @@ def build_levels():
         qmeta = [[0 for _ in range(MAP_W)] for _ in range(MAP_H)]
 
         for x, y, source, ax, ay, _alt in cells:
-            if source == terrain_source and y == max_y:
+            if source_kind.get(source, ATLAS_NONE) == ATLAS_TERRAIN and y == max_y_terrain:
                 continue
             tx = x + x_offset
             ty = y + y_offset
@@ -803,6 +1027,7 @@ def build_levels():
         bg_primary = 0
         bg_secondary = 0
         bg_clouds = False
+        bg_particles = 0
 
         for n in nodes:
             if not n.resource_path:
@@ -814,6 +1039,7 @@ def build_levels():
                 bg_primary = n.bg_primary_layer or 0
                 bg_secondary = n.bg_second_layer or 0
                 bg_clouds = bool(n.bg_overlay_clouds)
+                bg_particles = n.bg_particles or 0
                 continue
             if n.position is None:
                 continue
@@ -888,6 +1114,7 @@ def build_levels():
             "bg_primary": bg_primary,
             "bg_secondary": bg_secondary,
             "bg_clouds": bg_clouds,
+            "bg_particles": bg_particles,
             "pipes_entry": pipes_entry,
             "pipes_exit": pipes_exit,
             "pipe_pos_by_name": pipe_pos_by_name,
@@ -1061,8 +1288,12 @@ def build_levels():
 
         ename = f"enemies_{s['world']}_{s['stage']}_{s['section']}"
         out.append(f"static const EnemySpawn {ename}[] = {{")
-        for etype, ex, ey, edir in s["enemies"]:
-            out.append(f"  {{{etype}, {ex:.1f}f, {ey:.1f}f, {edir}}},")
+        for etype, ex, ey, edir, a, b in s["enemies"]:
+            # `a` may be an enum constant (string) for generator spawn types.
+            a_text = a if isinstance(a, str) else str(int(a))
+            out.append(
+                f"  {{{etype}, {ex:.1f}f, {ey:.1f}f, {edir}, {a_text}, {int(b)}}},"
+            )
         out.append("};")
         out.append("")
 
@@ -1095,7 +1326,7 @@ def build_levels():
                 f"{s['map_width']}, {s['map_height']}, {s['theme']}, "
                 f"{s['flag_x']}, {str(s['has_flag']).lower()}, "
                 f"{s['start_x']}, {s['start_y']}, "
-                f"{s.get('bg_primary', 0)}, {s.get('bg_secondary', 0)}, {str(bool(s.get('bg_clouds'))).lower()}, "
+                f"{s.get('bg_primary', 0)}, {s.get('bg_secondary', 0)}, {str(bool(s.get('bg_clouds'))).lower()}, {s.get('bg_particles', 0)}, "
                 f"{pname}, {pipe_count}, {ename}, {enemy_count}"
                 "},"
             )

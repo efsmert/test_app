@@ -1109,21 +1109,87 @@ The `SUMMARY.md` file provides essential project context that supplements the ge
 
 **Always start by reading `SUMMARY.md` to understand the current project state before making any changes.**
 
-**Always use the following command to compile the project:**
+**Use the following command to compile the project:**
 
 ```set -euo pipefail
 python3 smb_wiiu/tools/godot_levels_to_cpp.py
-python3 smb_wiiu/extract_rom.py "Super Mario Bros. (Japan, USA).nes" smb_wiiu/content >/dev/null
-python3 smb_wiiu/extract_rom.py "Super Mario Bros. (Japan, USA).nes" smb_wiiu/content --tilesets-only >/dev/null
-rm -rf smb_wiiu/build
 export DEVKITPRO=/opt/devkitpro
 export DEVKITPPC=/opt/devkitpro/devkitPPC
 export PATH="$PATH:$DEVKITPRO/tools/bin:$DEVKITPPC/bin:$DEVKITPRO/portlibs/wiiu/bin"
 make -C smb_wiiu
+make -C smb_wiiu wuhb
 make -C smb_wiiu cemu-sync
-ls -la smb_wiiu/smb_wiiu_cemu/code/smb_wiiu.rpx
+ls -la smb_wiiu/smb_wiiu.wuhb smb_wiiu/smb_wiiu_cemu/code/smb_wiiu.rpx | sed -n '1,5p'
 ```
 
 ---
 
 *This document compiled from comprehensive Wii U homebrew development research for use by AI coding agents.*
+
+## Code Documentation for Context Continuity
+
+Agents working on this codebase will inevitably hit context limits and need to resume work in fresh sessions. Write code that helps future agents (including yourself after a reset) understand the codebase quickly.
+
+### Required Documentation
+
+**Function/Class Docstrings (MANDATORY)**
+Every non-trivial function must have a brief docstring explaining:
+- What it does (purpose, not implementation)
+- Why it exists if non-obvious
+- Any gotchas or Wii U-specific considerations
+
+```cpp
+// Renders a single tile to the GX2 color buffer.
+// Uses CPU-side vertex buffer that MUST be cache-flushed before draw.
+// Called per-tile because batching caused z-fighting on hardware.
+void renderTile(int tileId, float x, float y);
+```
+
+**Non-Obvious Logic**
+Comment any code where the "why" isn't immediately clear:
+```cpp
+// Byte-swap required: Wii U is big-endian, WAV files are little-endian
+samples[i] = __builtin_bswap16(samples[i]);
+```
+
+**Wii U-Specific Workarounds**
+Always document platform quirks:
+```cpp
+// GX2 requires 256-byte alignment for vertex buffers - smaller alignments
+// cause silent corruption on hardware (works fine in Cemu)
+void* vbo = MEMAllocFromDefaultHeapEx(size, 0x100);
+```
+
+### What NOT to Comment
+
+- Trivial operations (`i++`, simple assignments)
+- Code that's self-explanatory from good naming
+- Restating what the code does without adding "why"
+
+### SUMMARY.md is Your Primary Context File
+
+The `SUMMARY.md` file is more valuable for context recovery than inline comments. When you complete significant work:
+
+1. Update your agent section in SUMMARY.md with:
+   - What you implemented/changed
+   - Key decisions and why you made them
+   - Gotchas you discovered
+   - What's left to do
+
+2. Keep inline comments focused on local "why" questions
+3. Keep SUMMARY.md focused on architectural/project-level context
+
+**The goal: A future agent should be able to read SUMMARY.md + function docstrings and understand the codebase without reading every line of code.**
+
+**Self improvement**
+Continuously improve agent workflows.
+
+When a repeated correction or better approach to something is discovered, or you make any significant changes to the project you MUST codify your new found knowledge and learnings by modifying your section of SUMMARY.md.
+
+You can modify SUMMARY.md without prior aproval as long as your edits continue at the end of the file.
+
+Be very detailed when you codify your instructions.
+
+If you utlise any of your codified instructions in future coding sessions call that out and let the user know that you peformed the action because of that specific rule in this file.
+
+We want to save time when you learn things so that we are not constantly searching for the same information over and over again.

@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vpad/input.h>
+#include <padscore/kpad.h>
+#include <padscore/wpad.h>
 #include <whb/proc.h>
 
 namespace Physics {
@@ -30,7 +32,7 @@ constexpr int PLAYER_DRAW_W_BIG = 16;
 // Gameplay collision boxes are intentionally slightly smaller than the visuals
 // to make tight gaps and pipe entry feel less "pixel perfect".
 constexpr float PLAYER_HIT_W_SMALL = 14.0f;
-constexpr float PLAYER_HIT_H_SMALL = 15.0f; // 1-tile gaps (16px) are enterable
+constexpr float PLAYER_HIT_H_SMALL = 14.0f; // 1-tile gaps (16px) are enterable
 constexpr float PLAYER_HIT_W_BIG = 15.0f;
 constexpr float PLAYER_HIT_H_BIG = 31.0f;   // 2-tile gaps (32px) are enterable
 enum GameState { GS_TITLE, GS_PLAYING, GS_FLAG, GS_DEAD, GS_GAMEOVER, GS_WIN, GS_PAUSE };
@@ -38,7 +40,13 @@ constexpr uint8_t QMETA_COIN = 0;
 constexpr uint8_t QMETA_POWERUP = 1;
 constexpr uint8_t QMETA_ONEUP = 2;
 constexpr uint8_t QMETA_STAR = 3;
-enum TitleMode { TITLE_MAIN = 0, TITLE_CHAR_SELECT = 1, TITLE_OPTIONS = 2, TITLE_EXTRAS = 3 };
+enum TitleMode {
+  TITLE_MAIN = 0,
+  TITLE_CHAR_SELECT = 1,
+  TITLE_OPTIONS = 2,
+  TITLE_EXTRAS = 3,
+  TITLE_MULTI_SELECT = 4,
+};
 constexpr uint8_t COL_NONE = 0;
 constexpr uint8_t COL_SOLID = 1;
 constexpr uint8_t COL_ONEWAY = 2;
@@ -58,6 +66,9 @@ struct Entity {
   float vx, vy;
   int dir, state;
   float timer;
+  int a, b;
+  float baseX, baseY;
+  float prevX, prevY;
 };
 struct Player {
   Rect r;
@@ -68,15 +79,22 @@ struct Player {
   int lives, coins, score;
   float invT, animT;
   float throwT;
+  float fireCooldown;
+  float swimCooldown;
+  float swimAnimT;
   bool dead;
 };
 
 static uint8_t g_map[MAP_H][MAP_W];
 static Entity g_ents[64];
-static Player g_p;
+static Player g_players[4];
+static Player &g_p = g_players[0];
 static float g_camX = 0;
 static GameState g_state = GS_PLAYING;
 static uint32_t g_held = 0, g_pressed = 0;
+static bool g_showDebugOverlay = false;
+static uint32_t g_playerHeld[4] = {0, 0, 0, 0};
+static uint32_t g_playerPressed[4] = {0, 0, 0, 0};
 static int g_loadedTex = 0;
 static int g_time = 400;
 static float g_timeAcc = 0;
@@ -85,6 +103,16 @@ static int g_flagX = 0;
 static bool g_hasFlag = false;
 static int g_sectionIndex = 0;
 static LevelSectionRuntime g_levelInfo = {};
+static bool g_allowCameraBacktrack = false;
+static bool g_multiplayerActive = false;
+static int g_playerCount = 1;
+static int g_playerCharIndex[4] = {0, 0, 0, 0};
+static bool g_playerReady[4] = {false, false, false, false};
+static int g_playerRemoteChan[4] = {-1, -1, -1, -1}; // -1=GamePad, else 0..3
+static bool g_remoteConnected[4] = {false, false, false, false};
+static uint32_t g_remoteHeld[4] = {0, 0, 0, 0};
+static uint32_t g_remotePressed[4] = {0, 0, 0, 0};
+static uint32_t g_remoteHoldRaw[4] = {0, 0, 0, 0};
 
 static SDL_Window *g_win = nullptr;
 static SDL_Renderer *g_ren = nullptr;
@@ -99,6 +127,11 @@ static SDL_Texture *g_texCoinIcon = nullptr;
 static SDL_Texture *g_texGoomba = nullptr;
 static SDL_Texture *g_texKoopa = nullptr;
 static SDL_Texture *g_texKoopaSheet = nullptr;
+static SDL_Texture *g_texCheepCheep = nullptr;
+static SDL_Texture *g_texBulletBill = nullptr;
+static SDL_Texture *g_texBowser = nullptr;
+static SDL_Texture *g_texPlatform = nullptr;
+static SDL_Texture *g_texBridgeAxe = nullptr;
 static SDL_Texture *g_texQuestion = nullptr;
 static SDL_Texture *g_texMushroom = nullptr;
 static SDL_Texture *g_texFireFlower = nullptr;
@@ -112,17 +145,23 @@ static SDL_Texture *g_texBgBushes = nullptr;
 static SDL_Texture *g_texBgCloudOverlay = nullptr;
 static SDL_Texture *g_texBgSky = nullptr;
 static SDL_Texture *g_texBgSecondary = nullptr; // Trees/Mushrooms layer
+static SDL_Texture *g_texParticleSnow = nullptr;
+static SDL_Texture *g_texParticleLeaves = nullptr;
+static SDL_Texture *g_texParticleAutumnLeaves = nullptr;
 static SDL_Texture *g_texFlagPole = nullptr;
 static SDL_Texture *g_texFlag = nullptr;
 static SDL_Texture *g_texCastle = nullptr;
+static int g_flagPoleShaftX = 8; // attachment point within 16px pole column
 static SDL_Rect g_castleDrawDst = {0, 0, 0, 0};
+static SDL_Rect g_castleOverlayDst = {0, 0, 0, 0};
 static bool g_castleDrawOn = false;
 static LevelTheme g_theme = THEME_OVERWORLD;
-static const char *g_charNames[] = {"Luigi", "Toad", "Toadette"};
-static const char *g_charDisplayNames[] = {"LUIGI", "TOAD", "TOADETTE"};
-static const int g_charCount = 3;
-static int g_charIndex = 0;
+static const char *g_charNames[] = {"Mario", "Luigi", "Toad", "Toadette"};
+static const char *g_charDisplayNames[] = {"MARIO", "LUIGI", "TOAD", "TOADETTE"};
+static const int g_charCount = 4;
+static int g_charIndex = 0; // Player 1 selection (mirrors g_playerCharIndex[0])
 static int g_menuIndex = 0;
+static int g_playerMenuIndex[4] = {0, 0, 0, 0};
 static int g_titleMode = TITLE_MAIN;
 static int g_optionsIndex = 0;
 static int g_mainMenuIndex = 0;
@@ -134,7 +173,6 @@ static int g_levelIndex = 0;
 static float g_levelTimer = 0.0f;
 static bool g_flagSfxPlayed = false;
 static bool g_castleSfxPlayed = false;
-static float g_fireCooldown = 0.0f;
 static bool g_randomTheme = false;
 static bool g_nightMode = false;
 static int g_themeOverride = -1;
@@ -178,6 +216,29 @@ struct ForegroundDeco {
 static ForegroundDeco g_fgDecos[192];
 static int g_fgDecoCount = 0;
 
+void renderCopyExWithShadowAngle(SDL_Texture *tex, const SDL_Rect *src,
+                                 const SDL_Rect *dst, double angle,
+                                 SDL_RendererFlip flip,
+                                 const SDL_Point *center);
+
+// Ambient background particles (Godot LevelBG: Snow, Leaves, Ember).
+// These are screen-space overlay particles (tied to the camera view, not world
+// tiles) to match the upstream CPUParticles2D setup.
+enum BgParticleMode { BG_PART_NONE = 0, BG_PART_SNOW = 1, BG_PART_LEAVES = 2, BG_PART_EMBER = 3, BG_PART_AUTO = 4 };
+struct AmbientParticle {
+  float x, y;
+  float vx, vy;
+  float rotDeg, vRotDeg;
+  uint8_t frame;
+  uint8_t a;
+};
+static AmbientParticle g_snowParticles[128];
+static AmbientParticle g_leafParticles[64];
+static AmbientParticle g_emberParticles[64];
+static int g_effectiveParticles = BG_PART_NONE;
+static float g_particleCamX = 0.0f;
+static int g_particleModeLast = BG_PART_NONE;
+
 struct TileBump {
   int tx;
   int ty;
@@ -214,6 +275,212 @@ static bool bumpTransformForTile(int tx, int ty, float &outLiftPx,
     }
   }
   return false;
+}
+
+static float frand(float a, float b) {
+  float t = (float)rand() / (float)RAND_MAX;
+  return a + (b - a) * t;
+}
+
+static int autoParticleModeForTheme() {
+  // Mirrors Godot's LevelBGNew.gd mapping:
+  // ["", "Snow", "Jungle", "Castle"] -> particles 0..3.
+  if (g_theme == THEME_SNOW)
+    return BG_PART_SNOW;
+  if (g_theme == THEME_JUNGLE || g_theme == THEME_AUTUMN)
+    return BG_PART_LEAVES;
+  if (g_theme == THEME_CASTLE || g_theme == THEME_VOLCANO ||
+      g_theme == THEME_CASTLE_WATER)
+    return BG_PART_EMBER;
+  return BG_PART_NONE;
+}
+
+static int effectiveBgParticles() {
+  int p = g_levelInfo.bgParticles;
+  // If a section doesn't explicitly set particles, we still want "vibe" by
+  // default. Treat None as Auto so castle/snow/jungle themes show ambient
+  // particles without needing per-level configuration.
+  if (p == BG_PART_NONE)
+    p = BG_PART_AUTO;
+  if (p == BG_PART_AUTO)
+    return autoParticleModeForTheme();
+  return p;
+}
+
+static void resetAmbientParticles() {
+  g_effectiveParticles = effectiveBgParticles();
+  g_particleCamX = g_camX;
+  g_particleModeLast = g_effectiveParticles;
+
+  for (auto &p : g_snowParticles) {
+    p.x = frand(0.0f, (float)GAME_W);
+    p.y = frand(0.0f, (float)GAME_H);
+    p.vx = frand(-6.0f, 6.0f);
+    p.vy = frand(20.0f, 50.0f);
+    p.rotDeg = 0.0f;
+    p.vRotDeg = 0.0f;
+    p.frame = 0;
+    p.a = (uint8_t)frand(180.0f, 255.0f);
+  }
+  for (auto &p : g_leafParticles) {
+    p.x = frand(0.0f, (float)GAME_W);
+    p.y = frand(0.0f, (float)GAME_H);
+    p.vx = frand(-18.0f, 18.0f);
+    p.vy = frand(25.0f, 100.0f);
+    p.rotDeg = frand(0.0f, 360.0f);
+    p.vRotDeg = frand(-720.0f, 720.0f);
+    p.frame = (uint8_t)(rand() & 1);
+    p.a = (uint8_t)frand(200.0f, 255.0f);
+  }
+  for (auto &p : g_emberParticles) {
+    p.x = frand(0.0f, (float)GAME_W);
+    p.y = frand(0.0f, (float)GAME_H);
+    p.vx = frand(-10.0f, 10.0f);
+    p.vy = frand(-20.0f, -5.0f);
+    p.rotDeg = 0.0f;
+    p.vRotDeg = 0.0f;
+    p.frame = (uint8_t)(rand() % 3);
+    p.a = (uint8_t)frand(160.0f, 240.0f);
+  }
+}
+
+static void updateAmbientParticles(float dt) {
+  g_effectiveParticles = effectiveBgParticles();
+  if (g_effectiveParticles == BG_PART_NONE)
+    return;
+
+  if (g_effectiveParticles != g_particleModeLast) {
+    g_particleModeLast = g_effectiveParticles;
+    g_particleCamX = g_camX;
+  }
+  constexpr float kParticlePanMul = 1.08f;
+  float camDx = g_camX - g_particleCamX;
+  g_particleCamX = g_camX;
+  float pan = camDx * kParticlePanMul;
+
+  if (g_effectiveParticles == BG_PART_SNOW) {
+    for (auto &p : g_snowParticles) {
+      p.x -= pan;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      // gentle horizontal sway
+      p.x += sinf((p.y * 0.03f) + (p.x * 0.01f)) * 6.0f * dt;
+      if (p.x < -8)
+        p.x += GAME_W + 16;
+      if (p.x > GAME_W + 8)
+        p.x -= GAME_W + 16;
+      if (p.y > GAME_H + 8) {
+        p.y = -8;
+        p.x = frand(0.0f, (float)GAME_W);
+        p.vx = frand(-6.0f, 6.0f);
+        p.vy = frand(20.0f, 50.0f);
+        p.a = (uint8_t)frand(180.0f, 255.0f);
+      }
+    }
+  } else if (g_effectiveParticles == BG_PART_LEAVES) {
+    for (auto &p : g_leafParticles) {
+      p.rotDeg += p.vRotDeg * dt;
+      p.x -= pan;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      // slow drift / swirl
+      p.x += sinf((p.y * 0.02f) + (p.rotDeg * 0.01f)) * 10.0f * dt;
+
+      if (p.y > GAME_H + 16 || p.x < -16 || p.x > GAME_W + 16) {
+        p.y = -16;
+        p.x = frand(0.0f, (float)GAME_W);
+        p.vx = frand(-18.0f, 18.0f);
+        p.vy = frand(25.0f, 100.0f);
+        p.rotDeg = frand(0.0f, 360.0f);
+        p.vRotDeg = frand(-720.0f, 720.0f);
+        p.frame = (uint8_t)(rand() & 1);
+        p.a = (uint8_t)frand(200.0f, 255.0f);
+      }
+    }
+  } else if (g_effectiveParticles == BG_PART_EMBER) {
+    for (auto &p : g_emberParticles) {
+      // light upward acceleration (matches Godot gravity = (0, -10))
+      p.vy += -10.0f * dt;
+      p.x -= pan;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      // Keep embers spanning the whole viewport even as the camera pans.
+      // Without this, parallax can push particles off-screen permanently.
+      while (p.x < -16.0f)
+        p.x += (float)GAME_W + 32.0f;
+      while (p.x > (float)GAME_W + 16.0f)
+        p.x -= (float)GAME_W + 32.0f;
+      if (p.y < -16) {
+        p.y = GAME_H + 16;
+        p.x = frand(0.0f, (float)GAME_W);
+        p.vx = frand(-10.0f, 10.0f);
+        p.vy = frand(-20.0f, -5.0f);
+        p.frame = (uint8_t)(rand() % 3);
+        p.a = (uint8_t)frand(160.0f, 240.0f);
+      }
+    }
+  }
+}
+
+static void renderAmbientParticles() {
+  if (g_effectiveParticles == BG_PART_NONE)
+    return;
+
+  if (g_effectiveParticles == BG_PART_SNOW) {
+    if (!g_texParticleSnow)
+      return;
+    SDL_Rect src = {0, 0, 8, 8};
+    for (auto &p : g_snowParticles) {
+      SDL_SetTextureAlphaMod(g_texParticleSnow, p.a);
+      SDL_Rect dst = {(int)p.x, (int)p.y, 8, 8};
+      SDL_RenderCopy(g_ren, g_texParticleSnow, &src, &dst);
+    }
+    SDL_SetTextureAlphaMod(g_texParticleSnow, 255);
+    return;
+  }
+
+  if (g_effectiveParticles == BG_PART_LEAVES) {
+    SDL_Texture *tex = (g_theme == THEME_AUTUMN) ? g_texParticleAutumnLeaves : g_texParticleLeaves;
+    if (!tex)
+      return;
+    for (auto &p : g_leafParticles) {
+      SDL_SetTextureAlphaMod(tex, p.a);
+      SDL_Rect src = {(int)p.frame * 8, 0, 8, 8};
+      SDL_Rect dst = {(int)p.x, (int)p.y, 12, 12};
+      SDL_Point c = {dst.w / 2, dst.h / 2};
+      renderCopyExWithShadowAngle(tex, &src, &dst, p.rotDeg, SDL_FLIP_NONE, &c);
+    }
+    SDL_SetTextureAlphaMod(tex, 255);
+    return;
+  }
+
+  if (g_effectiveParticles == BG_PART_EMBER) {
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+    for (auto &p : g_emberParticles) {
+      Uint8 r = 0, g = 0, b = 0;
+      switch (p.frame % 3) {
+      case 0: // dark ember
+        r = 134;
+        g = 49;
+        b = 14;
+        break;
+      case 1: // light ember
+        r = 255;
+        g = 183;
+        b = 98;
+        break;
+      default: // hot ember
+        r = 247;
+        g = 57;
+        b = 16;
+        break;
+      }
+      SDL_SetRenderDrawColor(g_ren, r, g, b, p.a);
+      SDL_Rect dst = {(int)p.x, (int)p.y, 1, 3};
+      SDL_RenderFillRect(g_ren, &dst);
+    }
+    return;
+  }
 }
 
 // Simple 5x7 font (bits are 0..4 in each row)
@@ -367,6 +634,38 @@ void renderCopyWithShadow(SDL_Texture *tex, const SDL_Rect *src,
   renderCopyExWithShadow(tex, src, dst, SDL_FLIP_NONE);
 }
 
+static void renderTiledBottomSlice(SDL_Texture *tex, float parallaxCamScale,
+                                   float camX) {
+  if (!tex)
+    return;
+
+  int texW = 0, texH = 0;
+  SDL_QueryTexture(tex, nullptr, nullptr, &texW, &texH);
+  // Be robust against backends that don't report size reliably.
+  if (texW <= 0)
+    texW = 512;
+  if (texH <= 0)
+    texH = 512;
+
+  // Some render backends incorrectly cull sprites whose destination rect
+  // starts far off-screen (negative Y). Instead of rendering a 512px-tall
+  // background anchored below the top of the screen, render only the visible
+  // bottom slice directly into the viewport.
+  int sliceH = (texH > GAME_H) ? GAME_H : texH;
+  SDL_Rect src = {0, texH - sliceH, texW, sliceH};
+
+  int startX = -(int)(camX * parallaxCamScale);
+  startX %= texW;
+  if (startX > 0)
+    startX -= texW;
+
+  int dstY = GAME_H - sliceH;
+  for (int x = startX; x < GAME_W; x += texW) {
+    SDL_Rect dst = {x, dstY, texW, sliceH};
+    SDL_RenderCopy(g_ren, tex, &src, &dst);
+  }
+}
+
 void renderTall16x32WithShadow(SDL_Texture *tex, int frameX, const SDL_Rect &dst,
                                SDL_RendererFlip flip) {
   SDL_Rect dstTop = dst;
@@ -386,32 +685,87 @@ bool overlap(const Rect &a, const Rect &b) {
          a.y + a.h > b.y;
 }
 
-inline bool jumpPressed() {
-  return (g_pressed & (VPAD_BUTTON_A | VPAD_BUTTON_B)) != 0;
+static Rect enemyHitRect(const Entity &e) {
+  Rect r = e.r;
+  // Match classic SMB-ish stomp feel: treat tall enemies as a 16x16 hitbox
+  // anchored to their feet.
+  if ((e.type == E_KOOPA || e.type == E_KOOPA_RED) && e.state == 0) {
+    r.y = r.y + (r.h - 16.0f);
+    r.h = 16.0f;
+  }
+  return r;
 }
 
-inline bool jumpHeld() {
-  return (g_held & (VPAD_BUTTON_A | VPAD_BUTTON_B)) != 0;
+inline bool jumpPressed(uint32_t pressed) {
+  return (pressed & (VPAD_BUTTON_A | VPAD_BUTTON_B)) != 0;
 }
 
-inline bool firePressed() {
-  return (g_pressed & (VPAD_BUTTON_X | VPAD_BUTTON_Y)) != 0;
+inline bool jumpPressed() { return jumpPressed(g_pressed); }
+
+inline bool jumpHeld(uint32_t held) {
+  return (held & (VPAD_BUTTON_A | VPAD_BUTTON_B)) != 0;
 }
+
+inline bool jumpHeld() { return jumpHeld(g_held); }
+
+inline bool firePressed(uint32_t pressed) {
+  return (pressed & (VPAD_BUTTON_X | VPAD_BUTTON_Y)) != 0;
+}
+
+inline bool firePressed() { return firePressed(g_pressed); }
 
 int mapWidth() { return g_levelInfo.mapWidth > 0 ? g_levelInfo.mapWidth : MAP_W; }
 
 bool solidAt(int tx, int ty);
 uint8_t collisionAt(int tx, int ty);
+static bool computeCastleDst(SDL_Rect &outMainDst, SDL_Rect &outOverlayDst);
 
 float standHeightForPower(Power p) {
   return (p >= P_BIG) ? PLAYER_HIT_H_BIG : PLAYER_HIT_H_SMALL;
 }
 
+static bool cameraBacktrackEnabled() {
+  return g_multiplayerActive || g_allowCameraBacktrack;
+}
+
+static int autoPrimaryBgForTheme() {
+  // Matches the upstream Godot project's "Auto" behavior for primary BG.
+  // 0 = Hills, 1 = Bush.
+  int primary = 0;
+  if ((g_theme == THEME_JUNGLE || g_theme == THEME_AUTUMN) &&
+      ((g_levelInfo.world > 4 && g_levelInfo.world <= 8) || g_nightMode)) {
+    primary = 1;
+  }
+  return primary;
+}
+
+static int effectiveBgPrimary() {
+  // Godot enum: 0 Hills, 1 Bush, 2 None, 3 Auto.
+  // For this port we always want a "full" decoration stack; treat None as Auto.
+  int primary = g_levelInfo.bgPrimary;
+  if (primary == 0 || primary == 1)
+    return primary;
+  return autoPrimaryBgForTheme();
+}
+
+static int effectiveBgSecondary() {
+  // Godot enum: 0 None, 1 Mushrooms, 2 Trees.
+  int secondary = g_levelInfo.bgSecondary;
+  if (secondary == 1 || secondary == 2)
+    return secondary;
+  // Default on for richer stages unless explicitly set.
+  return 2;
+}
+
+void setPlayerSizePreserveFeet(Player &p, float newW, float newH) {
+  float footY = p.r.y + p.r.h;
+  p.r.w = newW;
+  p.r.h = newH;
+  p.r.y = footY - newH;
+}
+
 void setPlayerSizePreserveFeet(float newW, float newH) {
-  float footY = g_p.r.y + g_p.r.h;
-  g_p.r.w = newW;
-  g_p.r.h = newH;
-  g_p.r.y = footY - newH;
+  setPlayerSizePreserveFeet(g_p, newW, newH);
 }
 
 bool rectBlockedBySolids(const Rect &r) {
@@ -518,9 +872,48 @@ int fireFlowerRowForTheme(LevelTheme t) {
   }
 }
 
-bool playerStomp(const Rect &enemy) {
-  return g_p.vy > 0.0f;
+static int flagPolePaletteIndexForTheme(LevelTheme t) {
+  switch (t) {
+  case THEME_UNDERGROUND:
+  case THEME_GHOSTHOUSE:
+    return 1;
+  case THEME_CASTLE:
+  case THEME_CASTLE_WATER:
+    return 2;
+  case THEME_UNDERWATER:
+    return 3;
+  case THEME_SNOW:
+    return 4;
+  case THEME_SPACE:
+    return 5;
+  default:
+    return 0;
+  }
 }
+
+static int flagPaletteIndexForTheme(LevelTheme t) {
+  // Flag.png palettes: default, Underground, Underwater, Snow, Space, Volcano, Bonus
+  switch (t) {
+  case THEME_UNDERGROUND:
+  case THEME_GHOSTHOUSE:
+    return 1;
+  case THEME_UNDERWATER:
+  case THEME_CASTLE_WATER:
+    return 2;
+  case THEME_SNOW:
+    return 3;
+  case THEME_SPACE:
+    return 4;
+  case THEME_VOLCANO:
+    return 5;
+  case THEME_BONUS:
+    return 6;
+  default:
+    return 0;
+  }
+}
+
+bool playerStomp(const Player &p) { return p.vy > 0.0f; }
 
 SDL_Texture *loadTex(const char *file) {
   SDL_Surface *s = nullptr;
@@ -546,11 +939,11 @@ SDL_Texture *loadTex(const char *file) {
       (strstr(file, "sprites/ui/TitleSMB1.png") != nullptr) ||
       (strstr(file, "sprites/ui/CoinIcon.png") != nullptr) ||
       (strstr(file, "FlagPole.png") != nullptr) ||
-      (strstr(file, "KoopaTroopaSheet.png") != nullptr) ||
       (strstr(file, "QuestionBlock.png") != nullptr) ||
       (strstr(file, "FireFlower.png") != nullptr) ||
       (strstr(file, "Fireball.png") != nullptr) ||
-      (strstr(file, "SpinningCoin.png") != nullptr)) {
+      (strstr(file, "SpinningCoin.png") != nullptr) ||
+      (strstr(file, "Platform.png") != nullptr)) {
     Uint32 colorKey = SDL_MapRGB(s->format, 0, 255, 0);
     SDL_SetColorKey(s, SDL_TRUE, colorKey);
   }
@@ -594,11 +987,11 @@ SDL_Texture *loadTexScaled(const char *file, int outW, int outH) {
       (strstr(file, "sprites/ui/TitleSMB1.png") != nullptr) ||
       (strstr(file, "sprites/ui/CoinIcon.png") != nullptr) ||
       (strstr(file, "FlagPole.png") != nullptr) ||
-      (strstr(file, "KoopaTroopaSheet.png") != nullptr) ||
       (strstr(file, "QuestionBlock.png") != nullptr) ||
       (strstr(file, "FireFlower.png") != nullptr) ||
       (strstr(file, "Fireball.png") != nullptr) ||
-      (strstr(file, "SpinningCoin.png") != nullptr)) {
+      (strstr(file, "SpinningCoin.png") != nullptr) ||
+      (strstr(file, "Platform.png") != nullptr)) {
     Uint32 colorKey = SDL_MapRGB(s->format, 0, 255, 0);
     SDL_SetColorKey(s, SDL_TRUE, colorKey);
   }
@@ -620,6 +1013,59 @@ SDL_Texture *loadTexScaled(const char *file, int outW, int outH) {
     SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
   }
   return t;
+}
+
+static SDL_Surface *loadSurface(const char *file) {
+  SDL_Surface *s = nullptr;
+  if (file[0] == '/' ||
+      strstr(file, "Super-Mario-Bros.-Remastered-Public") != nullptr) {
+    s = IMG_Load(file);
+  } else {
+    char path[512];
+    const char *paths[] = {"content/%s", "../content/%s", "fs:/vol/content/%s"};
+    for (int i = 0; i < 3 && !s; i++) {
+      snprintf(path, sizeof(path), paths[i], file);
+      s = IMG_Load(path);
+    }
+  }
+  return s;
+}
+
+static int computeFlagPoleShaftX() {
+  SDL_Surface *s = loadSurface("sprites/tilesets/FlagPole.png");
+  if (!s)
+    return 8;
+  // Expect 16px-wide palette columns. Sample a row below the top ball where the
+  // thin shaft begins, and attach the flag to the leftmost opaque pixel.
+  int sx = 8;
+  int sampleY = 16;
+  if (sampleY < 0)
+    sampleY = 0;
+  if (sampleY >= s->h)
+    sampleY = s->h - 1;
+
+  SDL_LockSurface(s);
+  Uint32 *pixels = (Uint32 *)s->pixels;
+  int pitch32 = s->pitch / 4;
+  Uint8 r, g, b, a;
+  int found = -1;
+  for (int x = 0; x < 16 && x < s->w; x++) {
+    Uint32 px = pixels[sampleY * pitch32 + x];
+    SDL_GetRGBA(px, s->format, &r, &g, &b, &a);
+    if (a != 0) {
+      found = x;
+      break;
+    }
+  }
+  SDL_UnlockSurface(s);
+  SDL_FreeSurface(s);
+  if (found >= 0)
+    sx = found;
+  if (sx < 0)
+    sx = 0;
+  if (sx > 15)
+    sx = 15;
+  return sx;
 }
 
 void destroyTex(SDL_Texture *&t) {
@@ -719,7 +1165,7 @@ const char *bgHillsName(LevelTheme t) {
   case THEME_AUTUMN:
     return "Autumn";
   case THEME_PIPELAND:
-    return "Pipeland";
+    return "PipeLand";
   case THEME_SPACE:
     return "Space";
   case THEME_VOLCANO:
@@ -782,32 +1228,35 @@ void loadBackgroundArt() {
   destroyTex(g_texBgSky);
   destroyTex(g_texBgSecondary);
 
-  char path[512];
   auto tryLoadBg = [&](const char *dir, const char *file) -> SDL_Texture * {
-    // Cap `file` to avoid -Wformat-truncation warnings (our filenames are tiny).
-    snprintf(path, sizeof(path), "sprites/Backgrounds/%s/%.*s", dir, 400, file);
-    return loadTex(path);
+    // Use separate buffers: `file` may itself be a temporary buffer, and we must
+    // never snprintf() into the same buffer we're also reading from.
+    char fullPath[512];
+    snprintf(fullPath, sizeof(fullPath), "sprites/Backgrounds/%s/%.*s", dir, 400,
+             file);
+    return loadTex(fullPath);
   };
   auto tryLoadBgName = [&](const char *dir, const char *base,
                            bool nightMode) -> SDL_Texture * {
     // Prefer LL variants; many non-LL files are chroma-key sources (green).
+    char fileBuf[512];
     if (nightMode) {
       // Some underwater assets use ...LLNight instead of ...NightLL.
-      snprintf(path, sizeof(path), "%sNightLL.png", base);
-      if (auto *t = tryLoadBg(dir, path))
+      snprintf(fileBuf, sizeof(fileBuf), "%sNightLL.png", base);
+      if (auto *t = tryLoadBg(dir, fileBuf))
         return t;
-      snprintf(path, sizeof(path), "%sLLNight.png", base);
-      if (auto *t = tryLoadBg(dir, path))
+      snprintf(fileBuf, sizeof(fileBuf), "%sLLNight.png", base);
+      if (auto *t = tryLoadBg(dir, fileBuf))
         return t;
-      snprintf(path, sizeof(path), "%sNight.png", base);
-      if (auto *t = tryLoadBg(dir, path))
+      snprintf(fileBuf, sizeof(fileBuf), "%sNight.png", base);
+      if (auto *t = tryLoadBg(dir, fileBuf))
         return t;
     }
-    snprintf(path, sizeof(path), "%sLL.png", base);
-    if (auto *t = tryLoadBg(dir, path))
+    snprintf(fileBuf, sizeof(fileBuf), "%sLL.png", base);
+    if (auto *t = tryLoadBg(dir, fileBuf))
       return t;
-    snprintf(path, sizeof(path), "%s.png", base);
-    return tryLoadBg(dir, path);
+    snprintf(fileBuf, sizeof(fileBuf), "%s.png", base);
+    return tryLoadBg(dir, fileBuf);
   };
 
   const char *hillsBase = bgHillsName(g_theme);
@@ -866,11 +1315,7 @@ void loadBackgroundArt() {
   }
 
   // Foreground (behind player) themed layer: Trees/Mushrooms.
-  int secondary = g_levelInfo.bgSecondary;
-  if (secondary == 0 && g_theme == THEME_OVERWORLD) {
-    // SMB1-style overworld generally benefits from the extra mid layer.
-    secondary = 2;
-  }
+  int secondary = effectiveBgSecondary();
 
   if (secondary == 1) {
     // Mushrooms use a suffix Night convention (e.g. BeachMushroomsNight).
@@ -1039,6 +1484,11 @@ void loadAssets() {
   g_texGoomba = loadTex("sprites/enemies/Goomba.png");
   g_texKoopa = loadTex("sprites/enemies/KoopaTroopa.png");
   g_texKoopaSheet = loadTex("sprites/enemies/KoopaTroopaSheet.png");
+  g_texCheepCheep = loadTex("sprites/enemies/CheepCheep.png");
+  g_texBulletBill = loadTex("sprites/enemies/BulletBill.png");
+  g_texBowser = loadTex("sprites/enemies/Bowser.png");
+  g_texPlatform = loadTex("sprites/tilesets/Platform.png");
+  g_texBridgeAxe = loadTex("sprites/items/BridgeAxe.png");
   g_texQuestion = loadTex("sprites/blocks/QuestionBlock.png");
   g_texMushroom = loadTex("sprites/items/SuperMushroom.png");
   g_texFireFlower = loadTex("sprites/items/FireFlower.png");
@@ -1047,6 +1497,10 @@ void loadAssets() {
   g_texFlagPole = loadTex("sprites/tilesets/FlagPole.png");
   g_texFlag = loadTex("sprites/tilesets/Flag.png");
   g_texCastle = loadTex("sprites/tilesets/EndingCastleSprite.png");
+  g_texParticleSnow = loadTex("sprites/particles/Snow.png");
+  g_texParticleLeaves = loadTex("sprites/particles/Leaves.png");
+  g_texParticleAutumnLeaves = loadTex("sprites/particles/AutumnLeaves.png");
+  g_flagPoleShaftX = computeFlagPoleShaftX();
   loadThemeTilesets();
   loadBackgroundArt();
 
@@ -1186,18 +1640,92 @@ void spawnEnemiesFromLevel() {
   int idx = 0;
   for (int i = 0; i < g_levelInfo.enemyCount && idx < 64; i++) {
     const EnemySpawn &s = g_levelInfo.enemies[i];
-    g_ents[idx].on = true;
-    g_ents[idx].type = s.type;
-    float h = 16.f;
-    float y = s.y - (h - 16.0f);
-    g_ents[idx].r = {s.x, y, 16.f, h};
-    g_ents[idx].vx = (s.type == E_GOOMBA || s.type == E_KOOPA)
-                         ? -Physics::ENEMY_SPEED
-                         : 0;
-    g_ents[idx].vy = 0;
-    g_ents[idx].dir = s.dir;
-    g_ents[idx].state = 0;
-    g_ents[idx].timer = 0;
+    Entity &e = g_ents[idx];
+    e.on = true;
+    e.type = s.type;
+    e.vx = 0.0f;
+    e.vy = 0.0f;
+    e.dir = s.dir;
+    e.state = 0;
+    e.timer = 0.0f;
+    e.a = s.a;
+    e.b = s.b;
+    e.baseX = s.x;
+    e.baseY = s.y;
+    e.prevX = s.x;
+    e.prevY = s.y;
+
+    switch (s.type) {
+    case E_GOOMBA:
+    case E_KOOPA:
+    case E_KOOPA_RED: {
+      float h = 16.0f;
+      float y = s.y - (h - 16.0f);
+      e.r = {s.x, y, 16.0f, h};
+      e.vx = -Physics::ENEMY_SPEED;
+      if (e.dir == 0)
+        e.dir = -1;
+      break;
+    }
+    case E_CHEEP_SWIM:
+    case E_CHEEP_LEAP:
+    case E_BULLET_BILL: {
+      e.r = {s.x, s.y, 16.0f, 16.0f};
+      if (e.type == E_BULLET_BILL && e.dir == 0)
+        e.dir = -1;
+      break;
+    }
+    case E_PLATFORM_SIDEWAYS: {
+      float w = (float)((s.a > 0) ? s.a : 48);
+      e.r = {s.x, s.y, w, 8.0f};
+      e.baseX = s.x;
+      e.baseY = s.y;
+      break;
+    }
+    case E_PLATFORM_VERTICAL: {
+      // Two modes:
+      // - `dir == 0`: pingpong platform (width stored in `a`)
+      // - `dir != 0`: elevator wrap platform (top/bottom in `a/b`)
+      if (s.dir == 0) {
+        float w = (float)((s.a > 0) ? s.a : 48);
+        e.r = {s.x, s.y, w, 8.0f};
+      } else {
+        e.r = {s.x, s.y, 48.0f, 8.0f};
+      }
+      e.baseX = s.x;
+      e.baseY = s.y;
+      break;
+    }
+    case E_PLATFORM_ROPE: {
+      float w = (float)((s.a > 0) ? s.a : 48);
+      e.r = {s.x, s.y, w, 8.0f};
+      e.baseX = s.x;
+      e.baseY = s.y;
+      break;
+    }
+    case E_ENTITY_GENERATOR:
+    case E_ENTITY_GENERATOR_STOP: {
+      e.r = {s.x, s.y, 0.0f, 0.0f};
+      e.state = 0; // inactive
+      break;
+    }
+    case E_CASTLE_AXE: {
+      e.r = {s.x, s.y, 16.0f, 16.0f};
+      break;
+    }
+    case E_BOWSER: {
+      // Spawn centered-ish; Bowser is large visually, but keep a smaller
+      // gameplay rect for now.
+      e.r = {s.x - 24.0f, s.y - 48.0f, 48.0f, 48.0f};
+      if (e.dir == 0)
+        e.dir = -1;
+      break;
+    }
+    default: {
+      e.r = {s.x, s.y, 16.0f, 16.0f};
+      break;
+    }
+    }
     idx++;
   }
 }
@@ -1504,19 +2032,34 @@ void applySection(bool resetTimer, int spawnX, int spawnY) {
   g_hasFlag = g_levelInfo.hasFlag;
   loadThemeTilesets();
   loadBackgroundArt();
+  resetAmbientParticles();
 
-  g_p.dead = false;
-  g_p.r = {(float)spawnX, (float)(spawnY - g_p.r.h), g_p.r.w, g_p.r.h};
-  g_p.vx = 0;
-  g_p.vy = 0;
-  g_p.ground = false;
-  g_p.right = true;
-  g_p.jumping = false;
-  g_p.crouch = false;
-  g_p.invT = 0;
-  g_p.animT = 0;
-  g_p.throwT = 0;
-  g_fireCooldown = 0.0f;
+  // Position all active players at the new section spawn. Player sizes/power
+  // are preserved, but runtime motion states are reset.
+  for (int i = 0; i < g_playerCount; i++) {
+    Player &p = g_players[i];
+    p.dead = false;
+    p.vx = 0;
+    p.vy = 0;
+    p.ground = false;
+    p.right = true;
+    p.jumping = false;
+    p.crouch = false;
+    p.invT = 0;
+    p.animT = 0;
+    p.throwT = 0;
+    p.fireCooldown = 0.0f;
+    p.swimCooldown = 0.0f;
+    p.swimAnimT = 9999.0f;
+
+    p.r.w = (p.power >= P_BIG) ? PLAYER_HIT_W_BIG : PLAYER_HIT_W_SMALL;
+    p.r.h = standHeightForPower(p.power);
+
+    // Stagger non-leader spawns a bit to reduce immediate overlap.
+    int ox = (i == 0) ? 0 : (-12 - 12 * (i - 1));
+    p.r.x = (float)(spawnX + ox);
+    p.r.y = (float)(spawnY - p.r.h);
+  }
   g_flagSfxPlayed = false;
   g_castleSfxPlayed = false;
 
@@ -1541,21 +2084,45 @@ static void setupLevel() {
 void startNewGame() {
   g_levelIndex = 0;
   g_sectionIndex = 0;
-  g_p.lives = 3;
-  g_p.coins = 0;
-  g_p.score = 0;
-  g_p.power = P_SMALL;
-  g_p.r.w = PLAYER_HIT_W_SMALL;
-  g_p.r.h = PLAYER_HIT_H_SMALL;
-  g_p.crouch = false;
+  for (int i = 0; i < g_playerCount; i++) {
+    Player &p = g_players[i];
+    p.lives = 3;
+    p.coins = 0;
+    p.score = 0;
+    p.power = P_SMALL;
+    p.r.w = PLAYER_HIT_W_SMALL;
+    p.r.h = PLAYER_HIT_H_SMALL;
+    p.crouch = false;
+    p.fireCooldown = 0.0f;
+    p.throwT = 0.0f;
+    p.invT = 0.0f;
+    p.animT = 0.0f;
+    p.swimCooldown = 0.0f;
+    p.swimAnimT = 9999.0f;
+    p.dead = false;
+    p.vx = 0.0f;
+    p.vy = 0.0f;
+    p.ground = false;
+    p.jumping = false;
+    p.right = true;
+  }
   setupLevel();
 }
 
 void restartLevel() {
-  g_p.power = P_SMALL;
-  g_p.r.w = PLAYER_HIT_W_SMALL;
-  g_p.r.h = PLAYER_HIT_H_SMALL;
-  g_p.crouch = false;
+  for (int i = 0; i < g_playerCount; i++) {
+    Player &p = g_players[i];
+    p.power = P_SMALL;
+    p.r.w = PLAYER_HIT_W_SMALL;
+    p.r.h = PLAYER_HIT_H_SMALL;
+    p.crouch = false;
+    p.fireCooldown = 0.0f;
+    p.throwT = 0.0f;
+    p.invT = 0.0f;
+    p.swimCooldown = 0.0f;
+    p.swimAnimT = 9999.0f;
+    p.dead = false;
+  }
   setupLevel();
 }
 
@@ -1565,6 +2132,45 @@ void nextLevel() {
     g_levelIndex = 0;
   g_sectionIndex = 0;
   setupLevel();
+}
+
+static uint32_t mapWiimoteButtonsToVpad(uint32_t wpadButtons, bool menuContext) {
+  uint32_t out = 0;
+  // Wii Remote is held sideways in SMB-style play:
+  //   - UP   (towards the IR camera) == LEFT
+  //   - DOWN (towards the B trigger) == RIGHT
+  //   - LEFT == DOWN
+  //   - RIGHT == UP
+  if (wpadButtons & WPAD_BUTTON_UP)
+    out |= VPAD_BUTTON_LEFT;
+  if (wpadButtons & WPAD_BUTTON_DOWN)
+    out |= VPAD_BUTTON_RIGHT;
+  if (wpadButtons & WPAD_BUTTON_LEFT)
+    out |= VPAD_BUTTON_DOWN;
+  if (wpadButtons & WPAD_BUTTON_RIGHT)
+    out |= VPAD_BUTTON_UP;
+  if (wpadButtons & WPAD_BUTTON_PLUS)
+    out |= VPAD_BUTTON_PLUS;
+  if (wpadButtons & WPAD_BUTTON_MINUS)
+    out |= VPAD_BUTTON_MINUS;
+
+  // Sideways Wii Remote convention:
+  // - 2: Jump / Confirm
+  // - 1: Run (gameplay) / Back (menus)
+  if (wpadButtons & (WPAD_BUTTON_2 | WPAD_BUTTON_A))
+    out |= VPAD_BUTTON_A;
+  if (wpadButtons & (WPAD_BUTTON_1 | WPAD_BUTTON_B)) {
+    out |= menuContext ? VPAD_BUTTON_B : VPAD_BUTTON_Y;
+  }
+  return out;
+}
+
+static bool anyWiimoteConnected() {
+  for (int i = 0; i < 4; i++) {
+    if (g_remoteConnected[i])
+      return true;
+  }
+  return false;
 }
 
 void input() {
@@ -1583,10 +2189,60 @@ void input() {
     else if (vpad.leftStick.x < -0.3f)
       g_held |= VPAD_BUTTON_LEFT;
   }
+
+  // Wii Remotes (Players 2-4). Map inputs into VPAD-like bits so existing
+  // logic can be reused.
+  bool menuContext = (g_state == GS_TITLE) || (g_state == GS_PAUSE);
+  for (int chan = 0; chan < 4; chan++) {
+    WPADExtensionType ext = WPAD_EXT_DEV_NOT_FOUND;
+    WPADError werr = WPADProbe((WPADChan)chan, &ext);
+    bool connected = (werr != WPAD_ERROR_NO_CONTROLLER);
+    g_remoteConnected[chan] = connected;
+    if (!connected) {
+      g_remoteHoldRaw[chan] = 0;
+      g_remoteHeld[chan] = 0;
+      g_remotePressed[chan] = 0;
+      continue;
+    }
+
+    KPADStatus st;
+    KPADError kerr = KPAD_ERROR_OK;
+    uint32_t n = KPADReadEx((KPADChan)chan, &st, 1, &kerr);
+    uint32_t rawHold = g_remoteHoldRaw[chan];
+    uint32_t rawTrig = 0;
+    if (n > 0 && kerr == KPAD_ERROR_OK) {
+      rawHold = st.hold;
+      rawTrig = st.trigger;
+      g_remoteHoldRaw[chan] = rawHold;
+    }
+    g_remoteHeld[chan] = mapWiimoteButtonsToVpad(rawHold, menuContext);
+    g_remotePressed[chan] = mapWiimoteButtonsToVpad(rawTrig, menuContext);
+  }
+
+  // Publish per-player button sets (player indices map to GamePad + assigned remotes).
+  g_playerHeld[0] = g_held;
+  g_playerPressed[0] = g_pressed;
+  for (int i = 1; i < 4; i++) {
+    int chan = g_playerRemoteChan[i];
+    if (chan >= 0 && chan < 4) {
+      g_playerHeld[i] = g_remoteHeld[chan];
+      g_playerPressed[i] = g_remotePressed[chan];
+    } else {
+      g_playerHeld[i] = 0;
+      g_playerPressed[i] = 0;
+    }
+  }
+
   SDL_Event e;
   while (SDL_PollEvent(&e))
     if (e.type == SDL_QUIT)
       WHBProcStopRunning();
+
+  // Quick debug toggle (GamePad right-stick click). Useful on hardware where
+  // some renderers behave differently than Cemu.
+  if (g_pressed & VPAD_BUTTON_STICK_R) {
+    g_showDebugOverlay = !g_showDebugOverlay;
+  }
 }
 
 void updateTitle() {
@@ -1604,8 +2260,36 @@ void updateTitle() {
     }
     if (g_pressed & VPAD_BUTTON_A) {
       if (g_mainMenuIndex == 0) {
-        g_titleMode = TITLE_CHAR_SELECT;
-        g_menuIndex = g_charIndex;
+        if (anyWiimoteConnected()) {
+          // Enter multiplayer character select.
+          g_titleMode = TITLE_MULTI_SELECT;
+
+          // Build the list of connected Wii Remote channels and assign them to
+          // player slots 2..4.
+          int chans[4] = {-1, -1, -1, -1};
+          int count = 0;
+          for (int c = 0; c < 4 && count < 3; c++) {
+            if (g_remoteConnected[c])
+              chans[count++] = c;
+          }
+          g_playerCount = 1 + count;
+          g_playerRemoteChan[0] = -1;
+          for (int i = 1; i < 4; i++)
+            g_playerRemoteChan[i] = (i - 1 < count) ? chans[i - 1] : -1;
+
+          for (int i = 0; i < 4; i++) {
+            g_playerReady[i] = false;
+            g_playerMenuIndex[i] = g_charIndex;
+          }
+          // Give each player a different default selection when possible.
+          for (int i = 1; i < g_playerCount; i++) {
+            g_playerMenuIndex[i] = (g_charIndex + i) % g_charCount;
+          }
+          g_playerMenuIndex[0] = g_charIndex;
+        } else {
+          g_titleMode = TITLE_CHAR_SELECT;
+          g_menuIndex = g_charIndex;
+        }
       } else if (g_mainMenuIndex == 1) {
         g_titleMode = TITLE_OPTIONS;
         g_optionsIndex = 0;
@@ -1642,18 +2326,81 @@ void updateTitle() {
     }
 
     if (g_pressed & VPAD_BUTTON_A) {
+      g_multiplayerActive = false;
+      g_playerCount = 1;
+      g_playerCharIndex[0] = g_menuIndex;
       g_charIndex = g_menuIndex;
       startNewGame();
     }
     break;
   }
+  case TITLE_MULTI_SELECT: {
+    auto allReady = [&]() -> bool {
+      for (int i = 0; i < g_playerCount; i++) {
+        if (!g_playerReady[i])
+          return false;
+      }
+      return true;
+    };
+
+    for (int i = 0; i < g_playerCount; i++) {
+      uint32_t pressed = g_playerPressed[i];
+      if (!g_playerReady[i]) {
+        if (pressed & VPAD_BUTTON_LEFT) {
+          g_playerMenuIndex[i] =
+              (g_playerMenuIndex[i] + g_charCount - 1) % g_charCount;
+          if (g_sfxMenuMove)
+            Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+        } else if (pressed & VPAD_BUTTON_RIGHT) {
+          g_playerMenuIndex[i] = (g_playerMenuIndex[i] + 1) % g_charCount;
+          if (g_sfxMenuMove)
+            Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+        }
+        if (pressed & VPAD_BUTTON_A) {
+          g_playerReady[i] = true;
+          if (g_sfxMenuMove)
+            Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+        }
+      } else {
+        // Un-ready with back.
+        if (pressed & VPAD_BUTTON_B) {
+          g_playerReady[i] = false;
+          if (g_sfxMenuMove)
+            Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+        }
+      }
+    }
+
+    // Back out to main menu (only GamePad can do this).
+    if (g_playerPressed[0] & VPAD_BUTTON_B) {
+      g_titleMode = TITLE_MAIN;
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    }
+
+    // Start once everyone is ready; allow A or PLUS on GamePad.
+    if (allReady() && (g_playerPressed[0] & (VPAD_BUTTON_PLUS | VPAD_BUTTON_A))) {
+      g_multiplayerActive = (g_playerCount > 1);
+      if (g_multiplayerActive)
+        g_allowCameraBacktrack = true; // forced on in multiplayer
+
+      for (int i = 0; i < g_playerCount; i++) {
+        g_playerCharIndex[i] = g_playerMenuIndex[i];
+      }
+      g_charIndex = g_playerCharIndex[0];
+      startNewGame();
+    }
+
+    break;
+  }
   case TITLE_OPTIONS: {
+    constexpr int kOptCount = 3;
     if (g_pressed & VPAD_BUTTON_UP) {
-      g_optionsIndex = (g_optionsIndex + 2 - 1) % 2;
+      g_optionsIndex = (g_optionsIndex + kOptCount - 1) % kOptCount;
       if (g_sfxMenuMove)
         Mix_PlayChannel(-1, g_sfxMenuMove, 0);
     } else if (g_pressed & VPAD_BUTTON_DOWN) {
-      g_optionsIndex = (g_optionsIndex + 1) % 2;
+      g_optionsIndex = (g_optionsIndex + 1) % kOptCount;
       if (g_sfxMenuMove)
         Mix_PlayChannel(-1, g_sfxMenuMove, 0);
     }
@@ -1665,6 +2412,8 @@ void updateTitle() {
           g_themeOverride = -1;
       } else if (g_optionsIndex == 1) {
         g_nightMode = !g_nightMode;
+      } else if (g_optionsIndex == 2) {
+        g_allowCameraBacktrack = !g_allowCameraBacktrack;
       }
       if (g_sfxMenuMove)
         Mix_PlayChannel(-1, g_sfxMenuMove, 0);
@@ -1732,6 +2481,11 @@ void updatePauseMenu() {
       g_state = GS_TITLE;
       g_titleMode = TITLE_MAIN;
       g_menuIndex = g_charIndex;
+      g_multiplayerActive = false;
+      g_playerCount = 1;
+      g_playerRemoteChan[0] = -1;
+      for (int i = 1; i < 4; i++)
+        g_playerRemoteChan[i] = -1;
       Mix_HaltMusic();
       break;
     default:
@@ -1783,19 +2537,393 @@ void spawnFireFlower(int tx, int ty) {
   }
 }
 
-void spawnFireball() {
-  if (g_fireCooldown > 0.0f)
+void spawnFireball(Player &p) {
+  if (p.fireCooldown > 0.0f)
     return;
   for (int i = 0; i < 64; i++) {
     if (!g_ents[i].on) {
-      float x = g_p.r.x + (g_p.right ? g_p.r.w - 4 : -4);
-      float y = g_p.r.y + (g_p.r.h * 0.5f);
-      g_ents[i] = {true, E_FIREBALL, {x, y, 16, 16}, 0, -90, g_p.right ? 1 : -1, 0, 0};
-      g_fireCooldown = 0.35f;
-      g_p.throwT = 0.15f;
+      float x = p.r.x + (p.right ? p.r.w - 4 : -4);
+      float y = p.r.y + (p.r.h * 0.5f);
+      g_ents[i] = {true, E_FIREBALL, {x, y, 16, 16}, 0, -90, p.right ? 1 : -1,
+                   0,    0};
+      p.fireCooldown = 0.35f;
+      p.throwT = 0.15f;
       if (g_sfxFireball)
         Mix_PlayChannel(-1, g_sfxFireball, 0);
       break;
+    }
+  }
+}
+
+static int findFreeEntitySlot() {
+  for (int i = 0; i < 64; i++) {
+    if (!g_ents[i].on)
+      return i;
+  }
+  return -1;
+}
+
+static bool isLiquidAt(int tx, int ty) {
+  if (!g_levelInfo.atlasT || !g_levelInfo.atlasX || !g_levelInfo.atlasY)
+    return false;
+  if (tx < 0 || tx >= mapWidth() || ty < 0 || ty >= MAP_H)
+    return false;
+  uint8_t ax = g_levelInfo.atlasX[ty][tx];
+  uint8_t ay = g_levelInfo.atlasY[ty][tx];
+  if (ax == 255 || ay == 255)
+    return false;
+  return g_levelInfo.atlasT[ty][tx] == ATLAS_LIQUID;
+}
+
+static bool rectTouchesLiquid(const Rect &r) {
+  // Underwater themes are "fully submerged" even if the tilemap doesn't
+  // explicitly mark every cell as liquid.
+  if (g_theme == THEME_UNDERWATER || g_theme == THEME_CASTLE_WATER)
+    return true;
+
+  int tx1 = (int)floorf(r.x / (float)TILE);
+  int tx2 = (int)floorf((r.x + r.w - 1.0f) / (float)TILE);
+  int ty1 = (int)floorf(r.y / (float)TILE);
+  int ty2 = (int)floorf((r.y + r.h - 1.0f) / (float)TILE);
+  for (int ty = ty1; ty <= ty2; ty++) {
+    for (int tx = tx1; tx <= tx2; tx++) {
+      if (isLiquidAt(tx, ty))
+        return true;
+    }
+  }
+  return false;
+}
+
+static float liquidSurfaceYAtWorldX(float worldX) {
+  int tx = (int)floorf(worldX / (float)TILE);
+  if (tx < 0)
+    tx = 0;
+  if (tx >= mapWidth())
+    tx = mapWidth() - 1;
+
+  // Find the topmost liquid tile in this column.
+  for (int ty = 0; ty < MAP_H; ty++) {
+    if (!isLiquidAt(tx, ty))
+      continue;
+    // Consider this the surface only if the tile above isn't liquid.
+    if (ty == 0 || !isLiquidAt(tx, ty - 1))
+      return (float)(ty * TILE);
+  }
+
+  // No liquid in this column; fall back to near-bottom.
+  return (float)((MAP_H - 2) * TILE);
+}
+
+static void updatePlatformsAndGenerators(float dt) {
+  // Update simple moving platforms first and carry players riding them.
+  for (int i = 0; i < 64; i++) {
+    Entity &e = g_ents[i];
+    if (!e.on)
+      continue;
+
+    if (e.type != E_PLATFORM_SIDEWAYS && e.type != E_PLATFORM_VERTICAL)
+      continue;
+
+    e.prevX = e.r.x;
+    e.prevY = e.r.y;
+
+    if (e.type == E_PLATFORM_SIDEWAYS) {
+      constexpr float kTravel = 48.0f;
+      constexpr float kDuration = 2.0f;
+      constexpr float kSpeed = kTravel / kDuration;
+      if (e.state == 0)
+        e.state = -1; // first leg moves left
+      e.r.x += (float)e.state * kSpeed * dt;
+      if (e.r.x <= e.baseX - kTravel) {
+        e.r.x = e.baseX - kTravel;
+        e.state = 1;
+      } else if (e.r.x >= e.baseX) {
+        e.r.x = e.baseX;
+        e.state = -1;
+      }
+    } else if (e.type == E_PLATFORM_VERTICAL) {
+      if (e.dir == 0) {
+        constexpr float kTravel = 128.0f;
+        constexpr float kDuration = 3.0f;
+        constexpr float kSpeed = kTravel / kDuration;
+        if (e.state == 0)
+          e.state = 1; // first leg moves down
+        e.r.y += (float)e.state * kSpeed * dt;
+        if (e.r.y >= e.baseY + kTravel) {
+          e.r.y = e.baseY + kTravel;
+          e.state = -1;
+        } else if (e.r.y <= e.baseY) {
+          e.r.y = e.baseY;
+          e.state = 1;
+        }
+      } else {
+        // Elevator wrap platforms: top/bottom stored in a/b, vertical dir in `dir`.
+        const float topY = (float)e.a;
+        const float bottomY = (float)e.b;
+        constexpr float kSpeed = 50.0f;
+        int vdir = (e.dir == 0) ? 1 : e.dir;
+        e.r.y += (float)vdir * kSpeed * dt;
+        if (vdir > 0 && e.r.y > bottomY)
+          e.r.y = topY;
+        if (vdir < 0 && e.r.y < topY)
+          e.r.y = bottomY;
+      }
+    }
+
+    float dx = e.r.x - e.prevX;
+    float dy = e.r.y - e.prevY;
+    if (dx == 0.0f && dy == 0.0f)
+      continue;
+
+    for (int pi = 0; pi < g_playerCount; pi++) {
+      Player &pl = g_players[pi];
+      if (pl.dead)
+        continue;
+      float bottom = pl.r.y + pl.r.h;
+      if (fabsf(bottom - e.prevY) > 0.75f)
+        continue;
+      if (pl.r.x + pl.r.w <= e.prevX + 0.5f)
+        continue;
+      if (pl.r.x >= e.prevX + e.r.w - 0.5f)
+        continue;
+      pl.r.x += dx;
+      pl.r.y += dy;
+      if (dy < 0.0f && rectBlockedBySolids(pl.r)) {
+        if (pi == 0) {
+          pl.dead = true;
+          pl.lives--;
+          g_state = GS_DEAD;
+          Mix_HaltMusic();
+        } else {
+          pl.vx = 0;
+          pl.vy = 0;
+          pl.r.x = fmaxf(0.0f, g_p.r.x - 24.0f - 12.0f * (pi - 1));
+          pl.r.y = g_p.r.y;
+          pl.invT = 1.5f;
+        }
+      }
+    }
+  }
+
+  // Rope elevator platforms (paired). They are exported as E_PLATFORM_ROPE with:
+  // - `dir`: pair id
+  // - `a`: platform width
+  // - `b`: rope_top (world y)
+  for (int i = 0; i < 64; i++) {
+    Entity &a = g_ents[i];
+    if (!a.on || a.type != E_PLATFORM_ROPE)
+      continue;
+    // Find partner.
+    int partnerIndex = -1;
+    for (int j = i + 1; j < 64; j++) {
+      if (g_ents[j].on && g_ents[j].type == E_PLATFORM_ROPE &&
+          g_ents[j].dir == a.dir) {
+        partnerIndex = j;
+        break;
+      }
+    }
+    if (partnerIndex < 0)
+      continue;
+    Entity &b = g_ents[partnerIndex];
+
+    if (a.state != 0 || b.state != 0) {
+      // Dropped: both platforms fall away.
+      a.prevY = a.r.y;
+      b.prevY = b.r.y;
+      constexpr float kGravity = 300.0f;
+      a.vy += kGravity * dt;
+      b.vy += kGravity * dt;
+      a.r.y += a.vy * dt;
+      b.r.y += b.vy * dt;
+      continue;
+    }
+
+    {
+      a.prevY = a.r.y;
+      b.prevY = b.r.y;
+
+      bool stoodA = false;
+      bool stoodB = false;
+      for (int pi = 0; pi < g_playerCount; pi++) {
+        const Player &pl = g_players[pi];
+        if (pl.dead || !pl.ground)
+          continue;
+        float bottom = pl.r.y + pl.r.h;
+        auto stoodOn = [&](const Entity &p) {
+          if (fabsf(bottom - p.r.y) > 0.75f)
+            return false;
+          if (pl.r.x + pl.r.w <= p.r.x + 0.5f)
+            return false;
+          if (pl.r.x >= p.r.x + p.r.w - 0.5f)
+            return false;
+          return true;
+        };
+        stoodA |= stoodOn(a);
+        stoodB |= stoodOn(b);
+      }
+
+      // If both are stood on (multiplayer), cancel out to keep things stable.
+      int net = (stoodA ? 1 : 0) - (stoodB ? 1 : 0);
+      if (net != 0) {
+        a.vy += (float)net * 120.0f * dt;
+      } else {
+        float t = dt * 2.0f;
+        if (t > 1.0f)
+          t = 1.0f;
+        a.vy = a.vy + (0.0f - a.vy) * t;
+      }
+      b.vy = -a.vy;
+
+      a.r.y += a.vy * dt;
+      b.r.y += b.vy * dt;
+
+      float ropeTop = (float)a.b;
+      if (a.r.y <= ropeTop || b.r.y <= ropeTop) {
+        a.state = 1;
+        b.state = 1;
+        // Start falling from current velocities.
+      }
+
+      float dyA = a.r.y - a.prevY;
+      float dyB = b.r.y - b.prevY;
+      if (dyA != 0.0f) {
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead)
+            continue;
+          float bottom = pl.r.y + pl.r.h;
+          if (fabsf(bottom - a.prevY) > 0.75f)
+            continue;
+          if (pl.r.x + pl.r.w <= a.r.x + 0.5f)
+            continue;
+          if (pl.r.x >= a.r.x + a.r.w - 0.5f)
+            continue;
+          pl.r.y += dyA;
+        }
+      }
+      if (dyB != 0.0f) {
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead)
+            continue;
+          float bottom = pl.r.y + pl.r.h;
+          if (fabsf(bottom - b.prevY) > 0.75f)
+            continue;
+          if (pl.r.x + pl.r.w <= b.r.x + 0.5f)
+            continue;
+          if (pl.r.x >= b.r.x + b.r.w - 0.5f)
+            continue;
+          pl.r.y += dyB;
+        }
+      }
+    }
+  }
+
+  // Entity generators / stoppers.
+  for (int i = 0; i < 64; i++) {
+    Entity &g = g_ents[i];
+    if (!g.on)
+      continue;
+    if (g.type != E_ENTITY_GENERATOR && g.type != E_ENTITY_GENERATOR_STOP)
+      continue;
+
+    // Generators are driven by Player 1 to match the upstream "player detection" trigger.
+    float playerX = g_p.r.x + g_p.r.w * 0.5f;
+    if (g.type == E_ENTITY_GENERATOR_STOP) {
+      if (g.state == 0 && playerX >= g.baseX - 8.0f) {
+        g.state = 1;
+        // Disable all generators for the rest of this section.
+        for (int j = 0; j < 64; j++) {
+          if (g_ents[j].on && g_ents[j].type == E_ENTITY_GENERATOR)
+            g_ents[j].state = 2; // permanently disabled
+        }
+      }
+      continue;
+    }
+
+    if (g.state == 2)
+      continue;
+
+    if (g.state == 0) {
+      if (playerX < g.baseX - 8.0f)
+        continue;
+      g.state = 1;
+      g.timer = 0.0f;
+    }
+
+    // Active generator: spawn immediately on activation, then periodically.
+    float threshold = (g.b > 0) ? ((float)g.b / 1000.0f) : 2.0f;
+    if (g.timer == 0.0f) {
+      // First spawn.
+      int slot = findFreeEntitySlot();
+      if (slot >= 0) {
+        Entity &e = g_ents[slot];
+        e = {};
+        e.on = true;
+        e.type = (EType)g.a;
+        e.state = 0;
+        e.timer = 0.0f;
+        e.vx = 0.0f;
+        e.vy = 0.0f;
+        e.baseX = 0.0f;
+        e.baseY = 0.0f;
+        e.prevX = 0.0f;
+        e.prevY = 0.0f;
+
+        if (e.type == E_BULLET_BILL) {
+          float y = g_p.r.y + (float)((rand() % 9) - 4);
+          if (y < 0)
+            y = 0;
+          if (y > GAME_H - 16)
+            y = GAME_H - 16;
+          e.r = {g_camX + GAME_W + 8.0f, y, 16.0f, 16.0f};
+          e.dir = -1;
+          e.vx = 90.0f;
+        } else if (e.type == E_CHEEP_LEAP) {
+          float x = g_camX + (GAME_W * 0.5f) - (float)(32 * (1 + (rand() % 4)));
+          float surface = liquidSurfaceYAtWorldX(x);
+          e.r = {x, surface - 16.0f, 16.0f, 16.0f};
+          e.dir = (rand() & 1) ? -1 : 1;
+          e.vx = (50.0f + (float)(rand() % 151)) * (float)e.dir;
+          e.vy = -(250.0f + (float)(rand() % 101));
+          e.b = (int)surface;
+        } else {
+          e.r = {g.baseX, g.baseY, 16.0f, 16.0f};
+        }
+      }
+      // Stagger subsequent spawns like the upstream randf_range(-2, 0).
+      g.timer = -((float)(rand() % 2000) / 1000.0f);
+    } else if (g.timer >= threshold) {
+      int slot = findFreeEntitySlot();
+      if (slot >= 0) {
+        Entity &e = g_ents[slot];
+        e = {};
+        e.on = true;
+        e.type = (EType)g.a;
+        e.state = 0;
+        e.timer = 0.0f;
+        if (e.type == E_BULLET_BILL) {
+          float y = g_p.r.y + (float)((rand() % 9) - 4);
+          if (y < 0)
+            y = 0;
+          if (y > GAME_H - 16)
+            y = GAME_H - 16;
+          e.r = {g_camX + GAME_W + 8.0f, y, 16.0f, 16.0f};
+          e.dir = -1;
+          e.vx = 90.0f;
+        } else if (e.type == E_CHEEP_LEAP) {
+          float x = g_camX + (GAME_W * 0.5f) - (float)(32 * (1 + (rand() % 4)));
+          float surface = liquidSurfaceYAtWorldX(x);
+          e.r = {x, surface - 16.0f, 16.0f, 16.0f};
+          e.dir = (rand() & 1) ? -1 : 1;
+          e.vx = (50.0f + (float)(rand() % 151)) * (float)e.dir;
+          e.vy = -(250.0f + (float)(rand() % 101));
+          e.b = (int)surface;
+        } else {
+          e.r = {g.baseX, g.baseY, 16.0f, 16.0f};
+        }
+      }
+      g.timer = -((float)(rand() % 2000) / 1000.0f);
     }
   }
 }
@@ -1811,85 +2939,163 @@ bool tryPipeEnter(const PipeLink &p) {
   return true;
 }
 
-void updatePlayer(float dt) {
-  if (g_p.dead || g_state == GS_FLAG)
+static void updateCameraFromLeader() {
+  // Center-follow camera. With backtracking disabled (classic SMB1), the camera
+  // only moves forward; it starts moving once the player reaches mid-screen.
+  float leaderMid = g_p.r.x + g_p.r.w * 0.5f;
+  float target = leaderMid - (GAME_W * 0.5f);
+
+  if (cameraBacktrackEnabled()) {
+    g_camX = target;
+  } else {
+    if (target > g_camX)
+      g_camX = target;
+  }
+
+  int viewTiles = (GAME_W + TILE - 1) / TILE;
+  float maxCam = (mapWidth() - viewTiles) * TILE;
+  if (maxCam < 0)
+    maxCam = 0;
+  if (g_camX < 0)
+    g_camX = 0;
+  if (g_camX > maxCam)
+    g_camX = maxCam;
+}
+
+static void enforceNonLeaderPlayersInView() {
+  if (g_playerCount <= 1)
     return;
-  for (auto &b : g_tileBumps) {
-    if (b.t > 0.0f) {
-      b.t -= dt;
-      if (b.t < 0.0f)
-        b.t = 0.0f;
+
+  float left = g_camX;
+  float right = g_camX + GAME_W;
+
+  for (int i = 1; i < g_playerCount; i++) {
+    Player &pl = g_players[i];
+    if (pl.dead)
+      continue;
+
+    float oldX = pl.r.x;
+    float minX = left;
+    float maxX = right - pl.r.w;
+    if (maxX < minX)
+      maxX = minX;
+    if (pl.r.x < minX)
+      pl.r.x = minX;
+    if (pl.r.x > maxX)
+      pl.r.x = maxX;
+
+    if (pl.r.x != oldX) {
+      // If the camera pushes a player into a solid tile, treat it as a crush.
+      if (rectBlockedBySolids(pl.r)) {
+        pl.lives--;
+        if (pl.lives <= 0) {
+          pl.dead = true;
+          continue;
+        }
+        pl.vx = 0.0f;
+        pl.vy = 0.0f;
+        pl.invT = 2.0f;
+        pl.throwT = 0.0f;
+        pl.fireCooldown = 0.0f;
+        pl.swimCooldown = 0.0f;
+        pl.swimAnimT = 9999.0f;
+        pl.r.x = fmaxf(0.0f, g_p.r.x - 24.0f - 12.0f * (i - 1));
+        pl.r.y = g_p.r.y;
+      }
     }
   }
-  if (g_p.invT > 0)
-    g_p.invT -= dt;
-  if (g_p.throwT > 0.0f) {
-    g_p.throwT -= dt;
-    if (g_p.throwT < 0.0f)
-      g_p.throwT = 0.0f;
+}
+
+static void updateOnePlayer(int playerIndex, float dt) {
+  Player &pl = g_players[playerIndex];
+  if (pl.dead || g_state == GS_FLAG)
+    return;
+
+  uint32_t held = g_playerHeld[playerIndex];
+  uint32_t pressed = g_playerPressed[playerIndex];
+
+  if (pl.invT > 0)
+    pl.invT -= dt;
+  if (pl.throwT > 0.0f) {
+    pl.throwT -= dt;
+    if (pl.throwT < 0.0f)
+      pl.throwT = 0.0f;
   }
-  if (g_fireCooldown > 0.0f)
-    g_fireCooldown -= dt;
-  g_p.animT += dt;
-  if (g_skidCooldown > 0)
-    g_skidCooldown -= dt;
+  if (pl.fireCooldown > 0.0f) {
+    pl.fireCooldown -= dt;
+    if (pl.fireCooldown < 0.0f)
+      pl.fireCooldown = 0.0f;
+  }
+  if (pl.swimCooldown > 0.0f) {
+    pl.swimCooldown -= dt;
+    if (pl.swimCooldown < 0.0f)
+      pl.swimCooldown = 0.0f;
+  }
+  pl.animT += dt;
+
+  bool inWater = rectTouchesLiquid(pl.r);
+  if (inWater) {
+    if (pl.swimAnimT < 9000.0f)
+      pl.swimAnimT += dt;
+  } else {
+    pl.swimAnimT = 9999.0f;
+  }
 
   float dir = 0;
-  bool downHeld = (g_held & VPAD_BUTTON_DOWN);
-  if (g_held & VPAD_BUTTON_RIGHT) {
+  bool downHeld = (held & VPAD_BUTTON_DOWN);
+  if (held & VPAD_BUTTON_RIGHT) {
     dir = 1;
-    g_p.right = true;
-  } else if (g_held & VPAD_BUTTON_LEFT) {
+    pl.right = true;
+  } else if (held & VPAD_BUTTON_LEFT) {
     dir = -1;
-    g_p.right = false;
+    pl.right = false;
   }
 
-  if (g_p.power == P_FIRE && firePressed() && !g_p.crouch) {
-    spawnFireball();
+  if (pl.power == P_FIRE && firePressed(pressed) && !pl.crouch) {
+    spawnFireball(pl);
   }
 
-  if (g_levelInfo.pipes && g_levelInfo.pipeCount > 0) {
+  // Pipes are driven by Player 1 to avoid splitting sections/camera.
+  if (playerIndex == 0 && g_levelInfo.pipes && g_levelInfo.pipeCount > 0) {
     for (int i = 0; i < g_levelInfo.pipeCount; i++) {
-      const PipeLink &p = g_levelInfo.pipes[i];
-      // Use the PipeArea node location as the "mouth" area. This avoids
-      // depending on tile classification (pipes use many atlas tiles) and fixes
-      // sideways pipes that don't form a simple vertical column.
-      float px = p.x * TILE;
-      float py = p.y * TILE;
+      const PipeLink &pipe = g_levelInfo.pipes[i];
+      float px = pipe.x * TILE;
+      float py = pipe.y * TILE;
       SDL_FRect mouth = {px, py, TILE * 2.0f, TILE * 2.0f};
 
-      float midX = g_p.r.x + g_p.r.w * 0.5f;
-      float midY = g_p.r.y + g_p.r.h * 0.5f;
-      bool overlapY = (midY >= mouth.y - 8.0f && midY <= mouth.y + mouth.h + 8.0f);
+      float midX = pl.r.x + pl.r.w * 0.5f;
+      float midY = pl.r.y + pl.r.h * 0.5f;
+      bool overlapY =
+          (midY >= mouth.y - 8.0f && midY <= mouth.y + mouth.h + 8.0f);
       bool overMouthX = (midX >= mouth.x + 2 && midX <= mouth.x + mouth.w - 2);
       constexpr float kEdgeEps = 6.0f;
 
-      switch (p.enterDir) {
+      switch (pipe.enterDir) {
       case 0: // Down
-        if (downHeld && g_p.ground && overMouthX &&
-            fabsf((g_p.r.y + g_p.r.h) - mouth.y) <= 8.0f) {
-          if (tryPipeEnter(p))
+        if (downHeld && pl.ground && overMouthX &&
+            fabsf((pl.r.y + pl.r.h) - mouth.y) <= 8.0f) {
+          if (tryPipeEnter(pipe))
             return;
         }
         break;
       case 1: // Up
-        if ((g_held & VPAD_BUTTON_UP) && overMouthX &&
-            fabsf(g_p.r.y - (mouth.y + mouth.h)) <= 8.0f) {
-          if (tryPipeEnter(p))
+        if ((held & VPAD_BUTTON_UP) && overMouthX &&
+            fabsf(pl.r.y - (mouth.y + mouth.h)) <= 8.0f) {
+          if (tryPipeEnter(pipe))
             return;
         }
         break;
       case 2: // Left
-        if ((g_held & VPAD_BUTTON_LEFT) && g_p.ground && overlapY &&
-            fabsf(g_p.r.x - (mouth.x + mouth.w)) <= kEdgeEps) {
-          if (tryPipeEnter(p))
+        if ((held & VPAD_BUTTON_LEFT) && pl.ground && overlapY &&
+            fabsf(pl.r.x - (mouth.x + mouth.w)) <= kEdgeEps) {
+          if (tryPipeEnter(pipe))
             return;
         }
         break;
       case 3: // Right
-        if ((g_held & VPAD_BUTTON_RIGHT) && g_p.ground && overlapY &&
-            fabsf((g_p.r.x + g_p.r.w) - mouth.x) <= kEdgeEps) {
-          if (tryPipeEnter(p))
+        if ((held & VPAD_BUTTON_RIGHT) && pl.ground && overlapY &&
+            fabsf((pl.r.x + pl.r.w) - mouth.x) <= kEdgeEps) {
+          if (tryPipeEnter(pipe))
             return;
         }
         break;
@@ -1899,76 +3105,83 @@ void updatePlayer(float dt) {
     }
   }
 
-  if (g_p.power >= P_BIG && g_p.ground) {
-    if (downHeld && !g_p.crouch) {
-      g_p.crouch = true;
-      setPlayerSizePreserveFeet(PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
-    } else if (!downHeld && g_p.crouch) {
-      // Only stand up if there's headroom.
-      Rect standRect = g_p.r;
-      standRect.h = standHeightForPower(g_p.power);
-      standRect.y = (g_p.r.y + g_p.r.h) - standRect.h;
-      standRect.w = PLAYER_HIT_W_BIG;
-      if (!rectBlockedBySolids(standRect)) {
-        g_p.crouch = false;
-        setPlayerSizePreserveFeet(PLAYER_HIT_W_BIG, standRect.h);
-      }
-    }
-  } else if (g_p.crouch) {
-    // If we left the ground while crouched, try to stand (but don't force it if
-    // we'd clip).
-    Rect standRect = g_p.r;
-    standRect.h = standHeightForPower(g_p.power);
-    standRect.y = (g_p.r.y + g_p.r.h) - standRect.h;
+  // Crouch is controlled by DOWN and can persist into the air (so crouch-jump
+  // keeps the crouch sprite + reduced hitbox).
+  bool wantsCrouch = (pl.power >= P_BIG) && downHeld;
+  if (wantsCrouch && !pl.crouch) {
+    pl.crouch = true;
+    setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+  } else if (!wantsCrouch && pl.crouch) {
+    Rect standRect = pl.r;
+    standRect.h = standHeightForPower(pl.power);
+    standRect.y = (pl.r.y + pl.r.h) - standRect.h;
     standRect.w = PLAYER_HIT_W_BIG;
     if (!rectBlockedBySolids(standRect)) {
-      g_p.crouch = false;
-      setPlayerSizePreserveFeet(PLAYER_HIT_W_BIG, standRect.h);
+      pl.crouch = false;
+      setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_BIG, standRect.h);
     }
   }
 
-  if (g_p.crouch) {
+  // While crouched, don't allow steering; we want a slide.
+  if (pl.crouch)
     dir = 0;
-  }
 
-  float maxSpd =
-      (g_held & VPAD_BUTTON_Y) ? Physics::RUN_SPEED : Physics::WALK_SPEED;
-  float accel = g_p.ground ? Physics::GROUND_ACCEL : Physics::AIR_ACCEL;
-  float decel = g_p.ground ? Physics::DECEL : Physics::AIR_ACCEL;
-  if (g_p.crouch && g_p.ground) {
-    maxSpd = 0;
-    accel = 0;
-    decel = Physics::DECEL * 4.0f;
+  float maxSpd = (held & VPAD_BUTTON_Y) ? Physics::RUN_SPEED : Physics::WALK_SPEED;
+  float accel = pl.ground ? Physics::GROUND_ACCEL : Physics::AIR_ACCEL;
+  float decel = pl.ground ? Physics::DECEL : Physics::AIR_ACCEL;
+  if (inWater) {
+    // Underwater motion is slower and floatier.
+    maxSpd *= 0.70f;
+    accel *= 0.65f;
+    decel *= 0.70f;
   }
-  if (dir != 0) {
-    g_p.vx += dir * accel;
-    if (fabsf(g_p.vx) > maxSpd) {
-      // If we just released run, ease back toward walk speed.
-      if (!(g_held & VPAD_BUTTON_Y)) {
-        g_p.vx -= dir * decel;
-        if (fabsf(g_p.vx) < maxSpd)
-          g_p.vx = dir * maxSpd;
-      } else {
-        g_p.vx = dir * maxSpd;
-      }
+  if (pl.crouch && pl.ground) {
+    // Duck-slide: preserve horizontal speed longer than normal friction.
+    float slideDecel = Physics::DECEL * 0.70f;
+    if (pl.vx > 0)
+      pl.vx = fmaxf(0.0f, pl.vx - slideDecel);
+    if (pl.vx < 0)
+      pl.vx = fminf(0.0f, pl.vx + slideDecel);
+  } else if (dir != 0) {
+    // Avoid runaway acceleration: accelerate only until reaching the active
+    // cap, and if we're over the cap (e.g. releasing RUN), decelerate down.
+    float v = pl.vx;
+    float s = (dir > 0) ? 1.0f : -1.0f;
+    float speedAlongDir = v * s;
+    if (speedAlongDir > maxSpd) {
+      speedAlongDir = fmaxf(maxSpd, speedAlongDir - decel);
+      pl.vx = speedAlongDir * s;
+    } else {
+      pl.vx += dir * accel;
+      if (pl.vx > maxSpd)
+        pl.vx = maxSpd;
+      if (pl.vx < -maxSpd)
+        pl.vx = -maxSpd;
     }
   } else {
-    if (g_p.vx > 0) {
-      g_p.vx = fmaxf(0.0f, g_p.vx - decel);
-    }
-    if (g_p.vx < 0) {
-      g_p.vx = fminf(0.0f, g_p.vx + decel);
-    }
+    if (pl.vx > 0)
+      pl.vx = fmaxf(0.0f, pl.vx - decel);
+    if (pl.vx < 0)
+      pl.vx = fminf(0.0f, pl.vx + decel);
   }
 
-  if (jumpPressed() && g_p.ground) {
+  if (inWater && jumpPressed(pressed) && pl.swimCooldown <= 0.0f) {
+    // Swim stroke (works both in-air and from the floor).
+    pl.vy = -130.0f;
+    pl.jumping = true;
+    pl.ground = false;
+    pl.swimCooldown = 0.28f;
+    pl.swimAnimT = 0.0f;
+    if (g_sfxJump)
+      Mix_PlayChannel(-1, g_sfxJump, 0);
+  } else if (jumpPressed(pressed) && pl.ground) {
     float jumpHeight = Physics::JUMP_HEIGHT;
-    if (fabsf(g_p.vx) > Physics::WALK_SPEED * 0.9f)
+    if (fabsf(pl.vx) > Physics::WALK_SPEED * 0.9f)
       jumpHeight *= 1.15f;
-    g_p.vy = -jumpHeight;
-    g_p.jumping = true;
-    g_p.ground = false;
-    if (g_p.power >= P_BIG) {
+    pl.vy = -jumpHeight;
+    pl.jumping = true;
+    pl.ground = false;
+    if (pl.power >= P_BIG) {
       if (g_sfxBigJump)
         Mix_PlayChannel(-1, g_sfxBigJump, 0);
       else if (g_sfxJump)
@@ -1978,38 +3191,45 @@ void updatePlayer(float dt) {
         Mix_PlayChannel(-1, g_sfxJump, 0);
     }
   }
-  if (!jumpHeld() && g_p.vy < -100)
-    g_p.vy = -100;
+  if (!jumpHeld(held) && pl.vy < (inWater ? -80.0f : -100.0f))
+    pl.vy = inWater ? -80.0f : -100.0f;
 
-  g_p.vy += (g_p.vy < 0 && g_p.jumping) ? Physics::JUMP_GRAVITY
-                                        : Physics::FALL_GRAVITY;
-  if (g_p.vy > Physics::MAX_FALL_SPEED)
-    g_p.vy = Physics::MAX_FALL_SPEED;
+  float jumpG = Physics::JUMP_GRAVITY;
+  float fallG = Physics::FALL_GRAVITY;
+  float maxFall = Physics::MAX_FALL_SPEED;
+  if (inWater) {
+    jumpG *= 0.25f;
+    fallG *= 0.25f;
+    maxFall *= 0.35f;
+  }
+  pl.vy += (pl.vy < 0 && pl.jumping) ? jumpG : fallG;
+  if (pl.vy > maxFall)
+    pl.vy = maxFall;
 
-  float moveX = g_p.vx * dt;
+  float moveX = pl.vx * dt;
   int stepsX = (int)ceilf(fabsf(moveX) / 6.0f);
   if (stepsX < 1)
     stepsX = 1;
   float stepX = moveX / stepsX;
+  float minWorldX = cameraBacktrackEnabled() ? 0.0f : g_camX;
   for (int i = 0; i < stepsX; i++) {
-    g_p.r.x += stepX;
-    if (g_p.r.x < g_camX)
-      g_p.r.x = g_camX;
+    pl.r.x += stepX;
+    if (pl.r.x < minWorldX)
+      pl.r.x = minWorldX;
 
-    // X collision
-    int ty1 = (int)(g_p.r.y / TILE),
-        ty2 = (int)((g_p.r.y + g_p.r.h - 1) / TILE);
-    int tx1 = (int)(g_p.r.x / TILE),
-        tx2 = (int)((g_p.r.x + g_p.r.w) / TILE);
+    int ty1 = (int)(pl.r.y / TILE);
+    int ty2 = (int)((pl.r.y + pl.r.h - 1) / TILE);
+    int tx1 = (int)(pl.r.x / TILE);
+    int tx2 = (int)((pl.r.x + pl.r.w) / TILE);
     bool hit = false;
     for (int ty = ty1; ty <= ty2; ty++) {
       for (int tx = tx1; tx <= tx2; tx++) {
         if (solidAt(tx, ty)) {
           if (stepX > 0)
-            g_p.r.x = tx * TILE - g_p.r.w;
+            pl.r.x = tx * TILE - pl.r.w;
           else if (stepX < 0)
-            g_p.r.x = (tx + 1) * TILE;
-          g_p.vx = 0;
+            pl.r.x = (tx + 1) * TILE;
+          pl.vx = 0;
           hit = true;
           break;
         }
@@ -2021,112 +3241,138 @@ void updatePlayer(float dt) {
       break;
   }
 
-  float moveY = g_p.vy * dt;
+  float moveY = pl.vy * dt;
   int stepsY = (int)ceilf(fabsf(moveY) / 6.0f);
   if (stepsY < 1)
     stepsY = 1;
   float stepY = moveY / stepsY;
-  g_p.ground = false;
+  pl.ground = false;
   for (int i = 0; i < stepsY; i++) {
-    g_p.r.y += stepY;
-    // Y collision (per step)
-    int ty1 = (int)(g_p.r.y / TILE);
-    // When moving down, include the tile boundary at the player's feet to avoid
-    // "ground" flicker when landing exactly on an edge.
-    int ty2 = (stepY >= 0) ? (int)((g_p.r.y + g_p.r.h) / TILE)
-                           : (int)((g_p.r.y + g_p.r.h - 1) / TILE);
-    int tx1 = (int)(g_p.r.x / TILE);
-    int tx2 = (int)((g_p.r.x + g_p.r.w - 1) / TILE);
+    pl.r.y += stepY;
+    int ty1 = (int)(pl.r.y / TILE);
+    int ty2 = (stepY >= 0) ? (int)((pl.r.y + pl.r.h) / TILE)
+                           : (int)((pl.r.y + pl.r.h - 1) / TILE);
+    int tx1 = (int)(pl.r.x / TILE);
+    int tx2 = (int)((pl.r.x + pl.r.w - 1) / TILE);
     bool hit = false;
     for (int ty = ty1; ty <= ty2; ty++) {
       for (int tx = tx1; tx <= tx2; tx++) {
         uint8_t col = collisionAt(tx, ty);
         if (col == COL_NONE)
           continue;
-        if (g_p.vy > 0) {
+        if (pl.vy > 0) {
           if (col == COL_ONEWAY) {
-            float prevBottom = (g_p.r.y - stepY) + g_p.r.h;
+            float prevBottom = (pl.r.y - stepY) + pl.r.h;
             float tileTop = ty * TILE;
             if (prevBottom > tileTop + 0.1f)
               continue;
           }
-          g_p.r.y = ty * TILE - g_p.r.h;
-          g_p.vy = 0;
-          g_p.ground = true;
-          g_p.jumping = false;
+          pl.r.y = ty * TILE - pl.r.h;
+          pl.vy = 0;
+          pl.ground = true;
+          pl.jumping = false;
           hit = true;
-	        } else if (g_p.vy < 0) {
-	          if (col != COL_SOLID)
-	            continue;
-	          int hitTy = ty;
-	          g_p.r.y = (hitTy + 1) * TILE;
-	          g_p.vy = 45;
+        } else if (pl.vy < 0) {
+          if (col != COL_SOLID)
+            continue;
+          int hitTy = ty;
+          pl.r.y = (hitTy + 1) * TILE;
+          pl.vy = 45;
 
-	          auto hitBlockAt = [&](int bx, int by) {
-	            if (bx < 0 || bx >= mapWidth() || by < 0 || by >= MAP_H)
-	              return;
-	            if (collisionAt(bx, by) != COL_SOLID)
-	              return;
-	            uint8_t t = g_map[by][bx];
-	            if (t == T_QUESTION) {
-	              g_map[by][bx] = T_USED;
-	              uint8_t meta = questionMetaAt(bx, by);
-	              if (meta == QMETA_POWERUP || meta == QMETA_STAR) {
-	                if (g_p.power == P_SMALL)
-	                  spawnMushroom(bx, by);
-	                else
-	                  spawnFireFlower(bx, by);
-	              } else if (meta == QMETA_ONEUP) {
-	                g_p.lives++;
-	                g_p.score += 1000;
-	                if (g_sfxPowerup)
-	                  Mix_PlayChannel(-1, g_sfxPowerup, 0);
-	              } else {
-	                g_p.coins++;
-	                g_p.score += 200;
-	                spawnCoinPopup(bx * TILE, by * TILE);
-	              }
-	              if (g_sfxBump)
-	                Mix_PlayChannel(-1, g_sfxBump, 0);
-	              return;
-	            }
-	            if (t == T_BRICK && g_p.power > P_SMALL) {
-	              g_map[by][bx] = T_EMPTY;
-	              g_p.score += 50;
-	              if (g_sfxBreak)
-	                Mix_PlayChannel(-1, g_sfxBreak, 0);
-	              return;
-	            }
-	            if (t == T_BRICK) {
-	              if (g_sfxBump)
-	                Mix_PlayChannel(-1, g_sfxBump, 0);
-	              addTileBump(bx, by);
-	              return;
-	            }
-	          };
+          auto hitBlockAt = [&](int bx, int by) {
+            if (bx < 0 || bx >= mapWidth() || by < 0 || by >= MAP_H)
+              return;
+            if (collisionAt(bx, by) != COL_SOLID)
+              return;
+            uint8_t t = g_map[by][bx];
+            if (t == T_QUESTION) {
+              g_map[by][bx] = T_USED;
+              uint8_t meta = questionMetaAt(bx, by);
+              if (meta == QMETA_POWERUP || meta == QMETA_STAR) {
+                if (pl.power == P_SMALL)
+                  spawnMushroom(bx, by);
+                else
+                  spawnFireFlower(bx, by);
+              } else if (meta == QMETA_ONEUP) {
+                pl.lives++;
+                pl.score += 1000;
+                if (g_sfxPowerup)
+                  Mix_PlayChannel(-1, g_sfxPowerup, 0);
+              } else {
+                pl.coins++;
+                pl.score += 200;
+                spawnCoinPopup(bx * TILE, by * TILE);
+              }
+              if (g_sfxBump)
+                Mix_PlayChannel(-1, g_sfxBump, 0);
+              return;
+            }
+            if (t == T_BRICK && pl.power > P_SMALL) {
+              g_map[by][bx] = T_EMPTY;
+              pl.score += 50;
+              if (g_sfxBreak)
+                Mix_PlayChannel(-1, g_sfxBreak, 0);
+              return;
+            }
+            if (t == T_BRICK) {
+              if (g_sfxBump)
+                Mix_PlayChannel(-1, g_sfxBump, 0);
+              addTileBump(bx, by);
+              return;
+            }
+          };
 
-	          int leftTx = (int)((g_p.r.x + 1) / TILE);
-	          int rightTx = (int)((g_p.r.x + g_p.r.w - 2) / TILE);
-	          float midX = g_p.r.x + g_p.r.w * 0.5f;
-	          float seamX = (leftTx + 1) * (float)TILE;
-	          bool spansTwo = rightTx > leftTx;
-	          bool inSeam = spansTwo && fabsf(midX - seamX) <= 2.0f;
-	          if (inSeam) {
-	            hitBlockAt(leftTx, hitTy);
-	            hitBlockAt(rightTx, hitTy);
-	          } else if (!spansTwo) {
-	            hitBlockAt(leftTx, hitTy);
-	          } else {
-	            int pick = (midX < seamX) ? leftTx : rightTx;
-	            hitBlockAt(pick, hitTy);
-	          }
-	          hit = true;
-	        }
+          int leftTx = (int)((pl.r.x + 1) / TILE);
+          int rightTx = (int)((pl.r.x + pl.r.w - 2) / TILE);
+          float midX = pl.r.x + pl.r.w * 0.5f;
+          float seamX = (leftTx + 1) * (float)TILE;
+          bool spansTwo = rightTx > leftTx;
+          bool inSeam = spansTwo && fabsf(midX - seamX) <= 2.0f;
+          if (inSeam) {
+            hitBlockAt(leftTx, hitTy);
+            hitBlockAt(rightTx, hitTy);
+          } else if (!spansTwo) {
+            hitBlockAt(leftTx, hitTy);
+          } else {
+            int pick = (midX < seamX) ? leftTx : rightTx;
+            hitBlockAt(pick, hitTy);
+          }
+          hit = true;
+        }
         if (hit)
           break;
       }
       if (hit)
         break;
+    }
+
+    // Moving platforms: allow landing from above (one-way).
+    if (!hit && stepY > 0) {
+      float prevBottom = (pl.r.y - stepY) + pl.r.h;
+      float newBottom = pl.r.y + pl.r.h;
+      for (int ei = 0; ei < 64; ei++) {
+        const Entity &pf = g_ents[ei];
+        if (!pf.on)
+          continue;
+        if (pf.type != E_PLATFORM_SIDEWAYS && pf.type != E_PLATFORM_VERTICAL &&
+            pf.type != E_PLATFORM_ROPE)
+          continue;
+        float platTop = pf.r.y;
+        if (prevBottom > platTop + 0.1f)
+          continue;
+        if (newBottom < platTop - 0.1f)
+          continue;
+        if (pl.r.x + pl.r.w <= pf.r.x + 0.5f)
+          continue;
+        if (pl.r.x >= pf.r.x + pf.r.w - 0.5f)
+          continue;
+        pl.r.y = platTop - pl.r.h;
+        pl.vy = 0;
+        pl.ground = true;
+        pl.jumping = false;
+        hit = true;
+        break;
+      }
     }
     if (hit)
       break;
@@ -2134,18 +3380,18 @@ void updatePlayer(float dt) {
 
   // Collect coins embedded in the tilemap.
   {
-    int tx1 = (int)(g_p.r.x / TILE);
-    int tx2 = (int)((g_p.r.x + g_p.r.w - 1) / TILE);
-    int ty1 = (int)(g_p.r.y / TILE);
-    int ty2 = (int)((g_p.r.y + g_p.r.h - 1) / TILE);
+    int tx1 = (int)(pl.r.x / TILE);
+    int tx2 = (int)((pl.r.x + pl.r.w - 1) / TILE);
+    int ty1 = (int)(pl.r.y / TILE);
+    int ty2 = (int)((pl.r.y + pl.r.h - 1) / TILE);
     for (int ty = ty1; ty <= ty2; ty++) {
       for (int tx = tx1; tx <= tx2; tx++) {
         if (tx < 0 || tx >= mapWidth() || ty < 0 || ty >= MAP_H)
           continue;
         if (g_map[ty][tx] == T_COIN) {
           g_map[ty][tx] = T_EMPTY;
-          g_p.coins++;
-          g_p.score += 200;
+          pl.coins++;
+          pl.score += 200;
           if (g_sfxCoin)
             Mix_PlayChannel(-1, g_sfxCoin, 0);
         }
@@ -2153,39 +3399,56 @@ void updatePlayer(float dt) {
     }
   }
 
-  // Flag pole collision
-  int flagTx = (int)((g_p.r.x + g_p.r.w / 2) / TILE);
-  if (g_hasFlag && flagTx == g_flagX && g_state == GS_PLAYING) {
-    g_state = GS_FLAG;
-    g_p.vx = 0;
-    g_p.vy = 0;
-    int height = 12 - (int)(g_p.r.y / TILE);
-    g_p.score += height * 100;
-    if (!g_flagSfxPlayed && g_sfxFlagSlide) {
-      Mix_PlayChannel(-1, g_sfxFlagSlide, 0);
-      g_flagSfxPlayed = true;
+  // Flag pole collision (Player 1 only).
+  if (playerIndex == 0) {
+    int flagTx = (int)((pl.r.x + pl.r.w / 2) / TILE);
+    if (g_hasFlag && flagTx == g_flagX && g_state == GS_PLAYING) {
+      g_state = GS_FLAG;
+      pl.vx = 0;
+      pl.vy = 0;
+      int height = 12 - (int)(pl.r.y / TILE);
+      pl.score += height * 100;
+      if (!g_flagSfxPlayed && g_sfxFlagSlide) {
+        Mix_PlayChannel(-1, g_sfxFlagSlide, 0);
+        g_flagSfxPlayed = true;
+      }
+      Mix_HaltMusic();
     }
-    Mix_HaltMusic();
   }
 
-  // Pit death
-  if (g_p.r.y > GAME_H + 32) {
-    g_p.dead = true;
-    g_p.lives--;
-    g_state = GS_DEAD;
-    Mix_HaltMusic();
+  // Pit death. Player 1 behaves like classic SMB; helpers respawn near P1.
+  if (pl.r.y > GAME_H + 32) {
+    if (playerIndex == 0) {
+      pl.dead = true;
+      pl.lives--;
+      g_state = GS_DEAD;
+      Mix_HaltMusic();
+    } else {
+      pl.vx = 0;
+      pl.vy = 0;
+      pl.r.x = fmaxf(0.0f, g_p.r.x - 24.0f - 12.0f * (playerIndex - 1));
+      pl.r.y = g_p.r.y;
+      pl.invT = 1.5f;
+    }
   }
+}
 
-  // Camera
-  float target = g_p.r.x - GAME_W / 3.0f;
-  if (target > g_camX)
-    g_camX = target;
-  int viewTiles = (GAME_W + TILE - 1) / TILE;
-  float maxCam = (mapWidth() - viewTiles) * TILE;
-  if (maxCam < 0)
-    maxCam = 0;
-  if (g_camX > maxCam)
-    g_camX = maxCam;
+void updatePlayers(float dt) {
+  for (auto &b : g_tileBumps) {
+    if (b.t > 0.0f) {
+      b.t -= dt;
+      if (b.t < 0.0f)
+        b.t = 0.0f;
+    }
+  }
+  if (g_skidCooldown > 0)
+    g_skidCooldown -= dt;
+
+  for (int i = 0; i < g_playerCount; i++)
+    updateOnePlayer(i, dt);
+
+  updateCameraFromLeader();
+  enforceNonLeaderPlayersInView();
 }
 
 void updateFlagSequence(float dt) {
@@ -2203,7 +3466,30 @@ void updateFlagSequence(float dt) {
     g_p.ground = true;
     g_p.r.x += 50 * dt;
     g_p.right = true;
-    if (g_p.r.x > 205 * TILE) {
+
+    // Switch levels once the player reaches the "front overlay" portion of the
+    // castle (the piece that hides the player entering the door), rather than
+    // relying on hardcoded X thresholds or nearby ground tiles.
+    bool atCastle = false;
+    SDL_Rect mainDst, overlayDst;
+    if (computeCastleDst(mainDst, overlayDst) && overlayDst.w > 0 &&
+        overlayDst.h > 0) {
+      Rect overlayWorld = {(float)(overlayDst.x + g_camX), (float)overlayDst.y,
+                           (float)overlayDst.w, (float)overlayDst.h};
+      // Don't end the level the moment we touch the overlay: let the player
+      // walk a bit further so they get properly hidden by the castle front.
+      Rect trigger = overlayWorld;
+      trigger.x += 2 * TILE;
+      trigger.w -= 2 * TILE;
+      if (trigger.w < 1)
+        trigger = overlayWorld;
+      atCastle = overlap(g_p.r, trigger);
+    } else {
+      // Fallback if no castle markers exist in this section.
+      atCastle = (g_p.r.x > (mapWidth() - 2) * TILE);
+    }
+
+    if (atCastle) {
       g_state = GS_WIN;
       g_p.score += g_time * 50;
       g_levelTimer = 0.0f;
@@ -2260,37 +3546,48 @@ void updateEntities(float dt) {
           continue;
         }
 
-        if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32 &&
-            !g_p.dead && overlap(g_p.r, e.r)) {
-          if (playerStomp(e.r)) {
-            e.state = 1;
-            e.timer = 0;
-            g_p.vy = jumpHeld() ? -Physics::BOUNCE_HEIGHT * 1.5f
-                                : -Physics::BOUNCE_HEIGHT;
-            g_p.score += 100;
-            if (g_sfxStomp)
-              Mix_PlayChannel(-1, g_sfxStomp, 0);
-            else if (g_sfxKick)
-              Mix_PlayChannel(-1, g_sfxKick, 0);
-          } else if (g_p.invT <= 0) {
-            if (g_p.power > P_SMALL) {
-              g_p.power = P_SMALL;
-              g_p.crouch = false;
-              setPlayerSizePreserveFeet(PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
-              g_p.invT = 2.0f;
-              if (g_sfxDamage)
-                Mix_PlayChannel(-1, g_sfxDamage, 0);
-            } else {
-              g_p.dead = true;
-              g_p.lives--;
-              g_state = GS_DEAD;
-              Mix_HaltMusic();
+        if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+          Rect er = enemyHitRect(e);
+          for (int pi = 0; pi < g_playerCount; pi++) {
+            Player &pl = g_players[pi];
+            if (pl.dead || !overlap(pl.r, er))
+              continue;
+
+            if (playerStomp(pl)) {
+              e.state = 1;
+              e.timer = 0;
+              pl.vy = jumpHeld(g_playerHeld[pi]) ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                                 : -Physics::BOUNCE_HEIGHT;
+              pl.score += 100;
+              if (g_sfxStomp)
+                Mix_PlayChannel(-1, g_sfxStomp, 0);
+              else if (g_sfxKick)
+                Mix_PlayChannel(-1, g_sfxKick, 0);
+            } else if (pl.invT <= 0) {
+              if (pl.power > P_SMALL) {
+                pl.power = P_SMALL;
+                pl.crouch = false;
+                setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+                pl.invT = 2.0f;
+                if (g_sfxDamage)
+                  Mix_PlayChannel(-1, g_sfxDamage, 0);
+              } else if (pi == 0) {
+                pl.dead = true;
+                pl.lives--;
+                g_state = GS_DEAD;
+                Mix_HaltMusic();
+              } else {
+                // Helpers don't end the run; just grant brief i-frames.
+                pl.invT = 2.0f;
+                pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+              }
             }
+            break;
           }
         }
       } else if (e.timer > 0.5f)
         e.on = false;
-    } else if (e.type == E_KOOPA) {
+    } else if (e.type == E_KOOPA || e.type == E_KOOPA_RED) {
       float moveSpeed = 0.0f;
       if (e.state == 0)
         moveSpeed = Physics::ENEMY_SPEED;
@@ -2330,48 +3627,294 @@ void updateEntities(float dt) {
         continue;
       }
 
-      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32 &&
-          !g_p.dead && overlap(g_p.r, e.r)) {
-        bool stomp = playerStomp(e.r);
-        if (stomp) {
-          g_p.vy = jumpHeld() ? -Physics::BOUNCE_HEIGHT * 1.5f
-                              : -Physics::BOUNCE_HEIGHT;
-          if (g_sfxStomp)
-            Mix_PlayChannel(-1, g_sfxStomp, 0);
-          else if (g_sfxKick)
-            Mix_PlayChannel(-1, g_sfxKick, 0);
+      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
 
-          if (e.state == 0) {
-            e.state = 1;
-            e.timer = 0;
-            e.r.y += 8;
-            e.r.h = 16;
-            e.dir = 0;
-          } else if (e.state == 2) {
-            e.state = 1;
-            e.timer = 0;
-            e.dir = 0;
-          }
-        } else if (g_p.invT <= 0) {
-          if (e.state == 1) {
-            e.state = 2;
-            e.timer = 0;
-            e.dir = (g_p.r.x < e.r.x) ? 1 : -1;
-            if (g_sfxKick)
+          bool stomp = playerStomp(pl);
+          if (stomp) {
+            pl.vy = jumpHeld(g_playerHeld[pi]) ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                               : -Physics::BOUNCE_HEIGHT;
+            if (g_sfxStomp)
+              Mix_PlayChannel(-1, g_sfxStomp, 0);
+            else if (g_sfxKick)
               Mix_PlayChannel(-1, g_sfxKick, 0);
-          } else if (g_p.power > P_SMALL) {
-            g_p.power = P_SMALL;
-            g_p.crouch = false;
-            setPlayerSizePreserveFeet(PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
-            g_p.invT = 2.0f;
-            if (g_sfxDamage)
-              Mix_PlayChannel(-1, g_sfxDamage, 0);
-          } else {
-            g_p.dead = true;
-            g_p.lives--;
-            g_state = GS_DEAD;
-            Mix_HaltMusic();
+
+            if (e.state == 0) {
+              e.state = 1;
+              e.timer = 0;
+              e.r.y += 8;
+              e.r.h = 16;
+              e.dir = 0;
+            } else if (e.state == 2) {
+              e.state = 1;
+              e.timer = 0;
+              e.dir = 0;
+            }
+          } else if (pl.invT <= 0) {
+            if (e.state == 1) {
+              e.state = 2;
+              e.timer = 0;
+              e.dir = (pl.r.x < e.r.x) ? 1 : -1;
+              if (g_sfxKick)
+                Mix_PlayChannel(-1, g_sfxKick, 0);
+            } else if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
           }
+          break;
+        }
+      }
+    } else if (e.type == E_BULLET_BILL) {
+      float speed = (e.vx != 0.0f) ? fabsf(e.vx) : 90.0f;
+      if (e.dir == 0)
+        e.dir = -1;
+      e.r.x += e.dir * speed * dt;
+
+      if (e.r.x < g_camX - 96 || e.r.x > g_camX + GAME_W + 96) {
+        e.on = false;
+        continue;
+      }
+
+      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
+          if (playerStomp(pl)) {
+            e.on = false;
+            pl.vy = jumpHeld(g_playerHeld[pi]) ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                               : -Physics::BOUNCE_HEIGHT;
+            pl.score += 200;
+            if (g_sfxStomp)
+              Mix_PlayChannel(-1, g_sfxStomp, 0);
+          } else if (pl.invT <= 0) {
+            if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
+        }
+      }
+    } else if (e.type == E_CHEEP_LEAP) {
+      // If this cheep wasn't initialized by a generator, give it a sane default.
+      if (e.vx == 0.0f && e.timer < 0.05f) {
+        e.dir = (rand() & 1) ? -1 : 1;
+        e.vx = (50.0f + (float)(rand() % 151)) * (float)e.dir;
+        e.vy = -(250.0f + (float)(rand() % 101));
+        e.b = (int)liquidSurfaceYAtWorldX(e.r.x + 8.0f);
+      }
+
+      constexpr float kGravity = 300.0f;
+      e.r.x += e.vx * dt;
+      e.vy += kGravity * dt;
+      e.r.y += e.vy * dt;
+
+      float surface = (e.b > 0) ? (float)e.b : liquidSurfaceYAtWorldX(e.r.x + 8.0f);
+      if (e.b <= 0)
+        e.b = (int)surface;
+      if (e.vy > 0.0f && e.r.y > surface + 16.0f) {
+        e.on = false;
+        continue;
+      }
+
+      if (e.r.x < g_camX - 96 || e.r.x > g_camX + GAME_W + 96) {
+        e.on = false;
+        continue;
+      }
+
+      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
+          if (playerStomp(pl)) {
+            e.on = false;
+            pl.vy = jumpHeld(g_playerHeld[pi]) ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                               : -Physics::BOUNCE_HEIGHT;
+            pl.score += 200;
+            if (g_sfxStomp)
+              Mix_PlayChannel(-1, g_sfxStomp, 0);
+          } else if (pl.invT <= 0) {
+            if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
+        }
+      }
+    } else if (e.type == E_CHEEP_SWIM) {
+      if (e.vx == 0.0f)
+        e.vx = 20.0f;
+      if (e.dir == 0)
+        e.dir = -1;
+
+      e.r.x += e.dir * e.vx * dt;
+      e.r.y = e.baseY + sinf(e.timer * 2.0f) * 4.0f;
+
+      int frontTx =
+          e.dir > 0 ? (int)((e.r.x + e.r.w) / TILE) : (int)(e.r.x / TILE);
+      int frontTy = (int)((e.r.y + e.r.h * 0.5f) / TILE);
+      if (solidAt(frontTx, frontTy))
+        e.dir = -e.dir;
+
+      if (e.r.x < g_camX - 96 || e.r.x > g_camX + GAME_W + 96) {
+        e.on = false;
+        continue;
+      }
+
+      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
+          if (playerStomp(pl)) {
+            e.on = false;
+            pl.vy = jumpHeld(g_playerHeld[pi]) ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                               : -Physics::BOUNCE_HEIGHT;
+            pl.score += 200;
+            if (g_sfxStomp)
+              Mix_PlayChannel(-1, g_sfxStomp, 0);
+          } else if (pl.invT <= 0) {
+            if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
+        }
+      }
+    } else if (e.type == E_CASTLE_AXE) {
+      // Touching the axe ends the castle section (like SMB1 bridge axe).
+      if (g_state == GS_PLAYING && overlap(g_p.r, e.r)) {
+        e.on = false;
+        g_state = GS_WIN;
+        g_levelTimer = 0.0f;
+        if (!g_castleSfxPlayed && g_sfxCastleClear) {
+          Mix_PlayChannel(-1, g_sfxCastleClear, 0);
+          g_castleSfxPlayed = true;
+        }
+      }
+    } else if (e.type == E_BOWSER) {
+      // Minimal Bowser: patrol + gravity + damage on contact. Fireballs can
+      // "wear him down" to keep the section beatable even without the axe.
+      if (e.dir == 0)
+        e.dir = -1;
+      float speed = 18.0f;
+      e.r.x += e.dir * speed * dt;
+      e.vy += 15.0f;
+      e.r.y += e.vy * dt;
+
+      int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
+      int bottomTy = (int)((e.r.y + e.r.h) / TILE);
+      {
+        uint8_t col = collisionAt(midTx, bottomTy);
+        if (col == COL_SOLID || col == COL_ONEWAY) {
+          if (col == COL_ONEWAY) {
+            float prevBottom = (e.r.y - (e.vy * dt)) + e.r.h;
+            float tileTop = bottomTy * TILE;
+            if (prevBottom > tileTop + 0.1f)
+              col = COL_NONE;
+          }
+          if (col != COL_NONE) {
+            e.r.y = bottomTy * TILE - e.r.h;
+            e.vy = 0;
+          }
+        }
+      }
+
+      int frontTx =
+          e.dir > 0 ? (int)((e.r.x + e.r.w) / TILE) : (int)(e.r.x / TILE);
+      int frontTy = (int)((e.r.y + e.r.h - 1) / TILE);
+      if (solidAt(frontTx, frontTy))
+        e.dir = -e.dir;
+
+      if (e.r.x < g_camX - 128 || e.r.y > GAME_H + 96) {
+        e.on = false;
+        continue;
+      }
+
+      if (e.r.x > g_camX - 64 && e.r.x < g_camX + GAME_W + 64) {
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, e.r))
+            continue;
+          if (pl.invT <= 0) {
+            if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
         }
       }
     } else if (e.type == E_MUSHROOM) {
@@ -2398,18 +3941,22 @@ void updateEntities(float dt) {
       int tx = e.dir > 0 ? (int)((e.r.x + e.r.w) / TILE) : (int)(e.r.x / TILE);
       if (solidAt(tx, (int)(e.r.y / TILE)))
         e.dir = -e.dir;
-      if (overlap(g_p.r, e.r)) {
+      for (int pi = 0; pi < g_playerCount; pi++) {
+        Player &pl = g_players[pi];
+        if (pl.dead || !overlap(pl.r, e.r))
+          continue;
         e.on = false;
-        if (g_p.power == P_SMALL) {
-          g_p.power = P_BIG;
-          g_p.crouch = false;
-          setPlayerSizePreserveFeet(PLAYER_HIT_W_BIG, PLAYER_HIT_H_BIG);
+        if (pl.power == P_SMALL) {
+          pl.power = P_BIG;
+          pl.crouch = false;
+          setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_BIG, PLAYER_HIT_H_BIG);
         }
-        g_p.score += 1000;
+        pl.score += 1000;
         if (g_sfxPowerup)
           Mix_PlayChannel(-1, g_sfxPowerup, 0);
         else if (g_sfxItemAppear)
           Mix_PlayChannel(-1, g_sfxItemAppear, 0);
+        break;
       }
     } else if (e.type == E_FIRE_FLOWER) {
       e.vy += 15.0f;
@@ -2431,25 +3978,30 @@ void updateEntities(float dt) {
           }
         }
       }
-      if (overlap(g_p.r, e.r)) {
+      for (int pi = 0; pi < g_playerCount; pi++) {
+        Player &pl = g_players[pi];
+        if (pl.dead || !overlap(pl.r, e.r))
+          continue;
         e.on = false;
-        if (g_p.power == P_SMALL) {
-          g_p.power = P_BIG;
-          g_p.crouch = false;
-          setPlayerSizePreserveFeet(PLAYER_HIT_W_BIG, PLAYER_HIT_H_BIG);
+        if (pl.power == P_SMALL) {
+          pl.power = P_BIG;
+          pl.crouch = false;
+          setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_BIG, PLAYER_HIT_H_BIG);
         } else {
-          g_p.power = P_FIRE;
+          pl.power = P_FIRE;
         }
-        g_p.score += 1000;
+        pl.score += 1000;
         if (g_sfxPowerup)
           Mix_PlayChannel(-1, g_sfxPowerup, 0);
         else if (g_sfxItemAppear)
           Mix_PlayChannel(-1, g_sfxItemAppear, 0);
+        break;
       }
     } else if (e.type == E_FIREBALL) {
-      const float speed = 200.0f;
+      // A little faster with smaller hops for better feel.
+      const float speed = 240.0f;
       e.r.x += e.dir * speed * dt;
-      e.vy += 260.0f * dt;
+      e.vy += 420.0f * dt;
       e.r.y += e.vy * dt;
 
       int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
@@ -2465,7 +4017,7 @@ void updateEntities(float dt) {
           }
           if (col != COL_NONE) {
             e.r.y = bottomTy * TILE - e.r.h;
-            e.vy = -90.0f;
+            e.vy = -55.0f;
           }
         }
       }
@@ -2485,11 +4037,19 @@ void updateEntities(float dt) {
         Entity &t = g_ents[j];
         if (!t.on)
           continue;
-        if (t.type != E_GOOMBA && t.type != E_KOOPA)
+        if (t.type != E_GOOMBA && t.type != E_KOOPA && t.type != E_KOOPA_RED &&
+            t.type != E_CHEEP_LEAP && t.type != E_CHEEP_SWIM &&
+            t.type != E_BULLET_BILL && t.type != E_BOWSER)
           continue;
-        if (!overlap(e.r, t.r))
+        if (!overlap(e.r, enemyHitRect(t)))
           continue;
-        t.on = false;
+        if (t.type == E_BOWSER) {
+          t.state += 1;
+          if (t.state >= 8)
+            t.on = false;
+        } else {
+          t.on = false;
+        }
         e.on = false;
         g_p.score += 200;
         break;
@@ -2507,7 +4067,7 @@ void updateEntities(float dt) {
       return false;
     if (e.type == E_GOOMBA)
       return e.state == 0;
-    if (e.type == E_KOOPA)
+    if (e.type == E_KOOPA || e.type == E_KOOPA_RED)
       return true;
     return false;
   };
@@ -2520,7 +4080,7 @@ void updateEntities(float dt) {
       Entity &b = g_ents[j];
       if (!enemyActive(b))
         continue;
-      if (!overlap(a.r, b.r))
+      if (!overlap(enemyHitRect(a), enemyHitRect(b)))
         continue;
       bool aShell = (a.type == E_KOOPA && a.state == 2);
       bool bShell = (b.type == E_KOOPA && b.state == 2);
@@ -2690,7 +4250,7 @@ void drawTile(int tx, int ty, uint8_t tile) {
 
 }
 
-static bool computeCastleDst(SDL_Rect &outDst) {
+static bool computeCastleDst(SDL_Rect &outMainDst, SDL_Rect &outOverlayDst) {
   if (!g_texCastle)
     return false;
   int minX = mapWidth();
@@ -2709,8 +4269,52 @@ static bool computeCastleDst(SDL_Rect &outDst) {
     return false;
   int texW = 0, texH = 0;
   SDL_QueryTexture(g_texCastle, nullptr, nullptr, &texW, &texH);
-  int baseY = (maxY + 1) * TILE - texH;
-  outDst = {minX * TILE - (int)g_camX, baseY, texW, texH};
+
+  // Determine the ground line under the castle by scanning for the *surface*
+  // collision (ignore T_CASTLE marker tiles, which may be stamped in the map).
+  int castleTilesW = (texW + TILE - 1) / TILE;
+  int surfaceTy = -1;
+  for (int x = minX; x < minX + castleTilesW && x < mapWidth(); x++) {
+    for (int y = MAP_H - 1; y >= 0; y--) {
+      if (g_map[y][x] == T_CASTLE)
+        continue;
+      uint8_t col = collisionAt(x, y);
+      if (!(col == COL_SOLID || col == COL_ONEWAY))
+        continue;
+      uint8_t above = (y > 0) ? collisionAt(x, y - 1) : COL_NONE;
+      if (above == COL_NONE) {
+        if (surfaceTy < 0 || y < surfaceTy)
+          surfaceTy = y;
+      }
+      // Keep scanning upward in case this column has thick ground.
+    }
+  }
+  if (surfaceTy < 0)
+    surfaceTy = maxY;
+  // The castle/overlay art is authored to sit *on* the ground tiles. The
+  // surface tile we find here is the first solid tile; align the sprite to the
+  // top of that tile and then lift by one tile to match the reference.
+  int groundY = surfaceTy * TILE;
+  groundY -= TILE;
+  if (groundY < 0)
+    groundY = 0;
+
+  // EndingCastleSprite.png layout:
+  // - Main castle sprite in the top 80px (y=0..79).
+  // - A separate "front overlay" piece in the bottom 40px (y=120..159),
+  //   positioned on the right half of the texture, used to hide the player as
+  //   they enter the door.
+  constexpr int kCastleMainH = 80;
+  constexpr int kOverlayY = 120;
+  constexpr int kOverlayX = 32;
+
+  int mainH = (texH < kCastleMainH) ? texH : kCastleMainH;
+  outMainDst = {minX * TILE - (int)g_camX, groundY - mainH, texW, mainH};
+
+  int overlayH = (texH > kOverlayY) ? (texH - kOverlayY) : 0;
+  int overlayW = (texW > kOverlayX) ? (texW - kOverlayX) : 0;
+  outOverlayDst = {outMainDst.x + kOverlayX, groundY - overlayH, overlayW,
+                   overlayH};
   return true;
 }
 
@@ -2846,10 +4450,66 @@ void render() {
       drawTextShadow((GAME_W - textWidth("Y OPTIONS", 1)) / 2, y + 86,
                      "Y OPTIONS", 1, {220, 220, 220, 255});
       SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+    } else if (g_titleMode == TITLE_MULTI_SELECT) {
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+      SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 170);
+      SDL_Rect panel = {20, 64, GAME_W - 40, 140};
+      SDL_RenderFillRect(g_ren, &panel);
+      SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
+      SDL_RenderDrawRect(g_ren, &panel);
+
+      const char *selText = "SELECT PLAYERS";
+      drawTextShadow((GAME_W - textWidth(selText, 2)) / 2, 72, selText, 2,
+                     {255, 255, 255, 255});
+
+      int slotCount = g_playerCount;
+      int slotW = 68;
+      int startX = (GAME_W - slotCount * slotW) / 2;
+      int baseY = 102;
+
+      const SDL_Color slotCols[4] = {
+          {255, 255, 255, 255}, {255, 120, 120, 255}, {120, 255, 120, 255},
+          {120, 160, 255, 255}};
+
+      for (int i = 0; i < slotCount; i++) {
+        int x = startX + i * slotW;
+        char pbuf[8];
+        snprintf(pbuf, sizeof(pbuf), "P%d", i + 1);
+        drawTextShadow(x + 10, baseY - 10, pbuf, 1, slotCols[i]);
+
+        int ci = g_playerMenuIndex[i] % g_charCount;
+        SDL_Rect src = {0, 0, 16, 16};
+        SDL_Rect dst = {x + 18, baseY + 10, 32, 32};
+        if (g_texPlayerSmall[ci])
+          renderCopyWithShadow(g_texPlayerSmall[ci], &src, &dst);
+
+        SDL_Rect box = {x + 10, baseY + 2, 48, 48};
+        SDL_SetRenderDrawColor(g_ren, slotCols[i].r, slotCols[i].g,
+                               slotCols[i].b, 255);
+        SDL_RenderDrawRect(g_ren, &box);
+
+        const char *name = g_charDisplayNames[ci];
+        drawTextShadow(x + (slotW - textWidth(name, 1)) / 2, baseY + 56, name,
+                       1, {255, 255, 255, 255});
+
+        const char *ready = g_playerReady[i] ? "READY" : "SELECT";
+        SDL_Color rc = g_playerReady[i] ? SDL_Color{255, 255, 0, 255}
+                                        : SDL_Color{200, 200, 200, 255};
+        drawTextShadow(x + (slotW - textWidth(ready, 1)) / 2, baseY + 70, ready,
+                       1, rc);
+      }
+
+      drawTextShadow((GAME_W - textWidth("P1: A READY  B BACK  + START", 1)) / 2,
+                     panel.y + panel.h - 22, "P1: A READY  B BACK  + START", 1,
+                     {220, 220, 220, 255});
+      drawTextShadow((GAME_W - textWidth("P2-4: 2 READY  1 BACK", 1)) / 2,
+                     panel.y + panel.h - 10, "P2-4: 2 READY  1 BACK", 1,
+                     {220, 220, 220, 255});
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
     } else if (g_titleMode == TITLE_OPTIONS) {
       SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
       SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 190);
-      SDL_Rect oPanel = {52, 58, GAME_W - 104, 130};
+      SDL_Rect oPanel = {52, 58, GAME_W - 104, 146};
       SDL_RenderFillRect(g_ren, &oPanel);
       SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
       SDL_RenderDrawRect(g_ren, &oPanel);
@@ -2861,13 +4521,20 @@ void render() {
       const char *line1 =
           g_randomTheme ? "RANDOM THEME: ON" : "RANDOM THEME: OFF";
       const char *line2 = g_nightMode ? "NIGHT MODE: ON" : "NIGHT MODE: OFF";
+      bool forcedBacktrack = g_multiplayerActive;
+      const char *line3 = (forcedBacktrack || g_allowCameraBacktrack)
+                              ? "CAMERA BACKTRACK: ON"
+                              : "CAMERA BACKTRACK: OFF";
       int baseY = 98;
       SDL_Color hi = {255, 255, 0, 255};
       SDL_Color norm = {255, 255, 255, 255};
       drawTextShadow(70, baseY, line1, 1, g_optionsIndex == 0 ? hi : norm);
       drawTextShadow(70, baseY + 16, line2, 1,
                      g_optionsIndex == 1 ? hi : norm);
-      drawTextShadow(70, baseY + 44, "B BACK", 1, {220, 220, 220, 255});
+      SDL_Color camCol = forcedBacktrack ? SDL_Color{160, 160, 160, 255}
+                                         : (g_optionsIndex == 2 ? hi : norm);
+      drawTextShadow(70, baseY + 32, line3, 1, camCol);
+      drawTextShadow(70, baseY + 56, "B BACK", 1, {220, 220, 220, 255});
       SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
     } else if (g_titleMode == TITLE_EXTRAS) {
       SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
@@ -2914,94 +4581,111 @@ void render() {
       }
     }
 
-    int primary = g_levelInfo.bgPrimary;
-	    if (primary == 3) {
-	      primary = 0;
-	      if ((g_theme == THEME_JUNGLE || g_theme == THEME_AUTUMN) &&
-	          ((g_levelInfo.world > 4 && g_levelInfo.world <= 8) || g_nightMode)) {
-	        primary = 1;
-	      }
-	    }
-	    // Some overworld sections in the source project mark the primary BG as
-	    // "None", but SMB1-style stages look better with hills+bushes by default.
-	    if (primary == 2 && g_theme == THEME_OVERWORLD)
-	      primary = 0;
+    int primary = effectiveBgPrimary();
 
     // Match the general SMB1 feel: for "Hills" levels, draw both hills and
     // bushes; for "Bush" levels, draw bushes only. If a section specifies
     // "None", keep the background empty (except optional sky).
     if (primary == 0 && g_texBgHills) {
-      // Draw the full texture anchored to the bottom so we don't accidentally
-      // crop off tall/variable assets (e.g. overworld hills).
-      SDL_Rect src = {0, 0, 512, 512};
-      SDL_Rect dst = {-(int)(g_camX * 0.10f) % 512, GAME_H - 512, 512, 512};
-      for (int x = dst.x; x < GAME_W; x += 512) {
-        SDL_Rect d = {x, dst.y, dst.w, dst.h};
-        SDL_RenderCopy(g_ren, g_texBgHills, &src, &d);
-      }
+      renderTiledBottomSlice(g_texBgHills, 0.10f, g_camX);
     }
 
     if ((primary == 0 || primary == 1) && g_texBgBushes) {
-      SDL_Rect src = {0, 0, 512, 512};
-      SDL_Rect dst = {-(int)(g_camX * 0.18f) % 512, GAME_H - 512, 512, 512};
-      for (int x = dst.x; x < GAME_W; x += 512) {
-        SDL_Rect d = {x, dst.y, dst.w, dst.h};
-        SDL_RenderCopy(g_ren, g_texBgBushes, &src, &d);
-      }
+      renderTiledBottomSlice(g_texBgBushes, 0.18f, g_camX);
     }
 
     // Secondary layer (trees/mushrooms) sits in front of the primary background
     // but still behind gameplay tiles/entities.
-    int secondary = g_levelInfo.bgSecondary;
-    if (secondary == 0 && g_theme == THEME_OVERWORLD) {
-      // Default the classic SMB1 overworld tree layer on, even if the source
-      // section doesn't explicitly request it.
-      secondary = 2;
-    }
+    int secondary = effectiveBgSecondary();
     if (secondary > 0 && g_texBgSecondary) {
-      SDL_Rect src = {0, 0, 512, 512};
-      SDL_Rect dst = {-(int)(g_camX * 0.32f) % 512, GAME_H - 512, 512, 512};
-      for (int x = dst.x; x < GAME_W; x += 512) {
-        SDL_Rect d = {x, dst.y, dst.w, dst.h};
-        SDL_RenderCopy(g_ren, g_texBgSecondary, &src, &d);
-      }
+      renderTiledBottomSlice(g_texBgSecondary, 0.32f, g_camX);
     }
 
-    // Clouds are subtle and look good on most outdoor levels; default them on
-    // for overworld even if the source section doesn't request them.
-    bool wantsClouds = g_levelInfo.bgClouds || (g_theme == THEME_OVERWORLD);
-    if (wantsClouds && g_texBgCloudOverlay) {
-      SDL_SetTextureAlphaMod(g_texBgCloudOverlay, 200);
-      SDL_Rect src = {0, 0, 512, 512};
-      SDL_Rect dst = {-(int)(g_camX * 0.06f) % 512, -40, 512, 512};
-      for (int x = dst.x; x < GAME_W; x += 512) {
-        SDL_Rect d = {x, dst.y, dst.w, dst.h};
-        SDL_RenderCopy(g_ren, g_texBgCloudOverlay, &src, &d);
+  }
+
+  // Foreground decorations (still behind the player). Draw these *before*
+  // gameplay tiles so pipes/blocks correctly occlude them.
+  if (g_texDeco && g_fgDecoCount > 0) {
+    for (int i = 0; i < g_fgDecoCount; i++) {
+      const ForegroundDeco &d = g_fgDecos[i];
+      int baseX = d.tx * TILE - (int)g_camX;
+      if (baseX < -(int)(d.w * TILE) || baseX > GAME_W)
+        continue;
+      for (int c = 0; c < d.cellCount; c++) {
+        const auto &cell = d.cells[c];
+        SDL_Rect src = {(int)cell.ax * 16, (int)cell.ay * 16, 16, 16};
+        SDL_Rect dst = {baseX + cell.dx * TILE, (d.ty + cell.dy) * TILE, 16,
+                        16};
+        renderCopyWithShadow(g_texDeco, &src, &dst);
       }
-      SDL_SetTextureAlphaMod(g_texBgCloudOverlay, 255);
     }
-	  }
+  }
 
-	  // Foreground decorations (still behind the player). Draw these *before*
-	  // gameplay tiles so pipes/blocks correctly occlude them.
-	  if (g_texDeco && g_fgDecoCount > 0) {
-	    for (int i = 0; i < g_fgDecoCount; i++) {
-	      const ForegroundDeco &d = g_fgDecos[i];
-	      int baseX = d.tx * TILE - (int)g_camX;
-	      if (baseX < -(int)(d.w * TILE) || baseX > GAME_W)
-	        continue;
-	      for (int c = 0; c < d.cellCount; c++) {
-	        const auto &cell = d.cells[c];
-	        SDL_Rect src = {(int)cell.ax * 16, (int)cell.ay * 16, 16, 16};
-	        SDL_Rect dst = {baseX + cell.dx * TILE, (d.ty + cell.dy) * TILE, 16,
-	                        16};
-	        renderCopyWithShadow(g_texDeco, &src, &dst);
-	      }
-	    }
-	  }
+  if (g_showDebugOverlay) {
+    char buf[128];
+    int y = 2;
+    SDL_Color c = {255, 255, 0, 255};
 
-	  // Tiles
-	  int startTx = (int)(g_camX / TILE) - 1;
+    snprintf(buf, sizeof(buf), "THEME %s  NIGHT %d", themeName(g_theme),
+             g_nightMode ? 1 : 0);
+    drawTextShadow(2, y, buf, 1, c);
+    y += 10;
+
+	    snprintf(buf, sizeof(buf), "BG P:%d->%d S:%d->%d C:%d",
+	             g_levelInfo.bgPrimary, effectiveBgPrimary(), g_levelInfo.bgSecondary,
+	             effectiveBgSecondary(), (g_levelInfo.bgClouds ? 1 : 0));
+	    drawTextShadow(2, y, buf, 1, {255, 255, 255, 255});
+	    y += 10;
+
+	    snprintf(buf, sizeof(buf), "PARTICLES %d->%d  TEX snow:%s leaves:%s",
+	             g_levelInfo.bgParticles, effectiveBgParticles(),
+	             g_texParticleSnow ? "OK" : "NULL",
+	             (g_texParticleLeaves && g_texParticleAutumnLeaves) ? "OK" : "NULL");
+	    drawTextShadow(2, y, buf, 1, {255, 255, 255, 255});
+	    y += 10;
+
+    auto texLine = [&](const char *name, SDL_Texture *t) {
+      int w = 0, h = 0;
+      if (t)
+        SDL_QueryTexture(t, nullptr, nullptr, &w, &h);
+      snprintf(buf, sizeof(buf), "%s %s %dx%d", name, t ? "OK" : "NULL", w, h);
+      drawTextShadow(2, y, buf, 1, t ? SDL_Color{120, 255, 120, 255}
+                                     : SDL_Color{255, 120, 120, 255});
+      y += 10;
+    };
+
+    texLine("SKY", g_texBgSky);
+    texLine("HILLS", g_texBgHills);
+    texLine("BUSH", g_texBgBushes);
+    texLine("SEC", g_texBgSecondary);
+    texLine("CLOUD", g_texBgCloudOverlay);
+
+    snprintf(buf, sizeof(buf), "FGDECO TEX %s  COUNT %d",
+             g_texDeco ? "OK" : "NULL", g_fgDecoCount);
+    drawTextShadow(2, y, buf, 1, {255, 255, 255, 255});
+    y += 10;
+
+    int atlasDeco = 0;
+    int atlasAny = 0;
+    if (g_levelInfo.atlasT && g_levelInfo.atlasX && g_levelInfo.atlasY) {
+      int w = mapWidth();
+      for (int ty = 0; ty < MAP_H; ty++) {
+        for (int tx = 0; tx < w; tx++) {
+          if (g_levelInfo.atlasX[ty][tx] == 255 ||
+              g_levelInfo.atlasY[ty][tx] == 255)
+            continue;
+          atlasAny++;
+          if (g_levelInfo.atlasT[ty][tx] == ATLAS_DECO)
+            atlasDeco++;
+        }
+      }
+    }
+    snprintf(buf, sizeof(buf), "ATLAS TILES %d  DECO %d", atlasAny, atlasDeco);
+    drawTextShadow(2, y, buf, 1, {255, 255, 255, 255});
+  }
+
+  // Tiles
+  int startTx = (int)(g_camX / TILE) - 1;
 	  int viewTiles = (GAME_W + TILE - 1) / TILE + 2;
 	  auto isDecoTile = [&](int tx, int ty) -> bool {
     if (!g_levelInfo.atlasT || !g_levelInfo.atlasX || !g_levelInfo.atlasY)
@@ -3027,39 +4711,75 @@ void render() {
 
 	    // Flagpole + flag
 	    if (g_hasFlag) {
-	      int groundY = MAP_H - 1;
-	      for (int y = MAP_H - 1; y >= 0; y--) {
-	        if (solidAt(g_flagX, y) || solidAt(g_flagX + 1, y)) {
-	          groundY = y;
-	          break;
+	      // Find the local ground under/near the pole. Some level data may place
+	      // collision markers in the pole columns, so scan a small range.
+	      int groundTy = MAP_H - 1;
+	      int foundX = g_flagX;
+	      bool found = false;
+	      for (int y = MAP_H - 1; y >= 0 && !found; y--) {
+	        for (int x = g_flagX - 2; x <= g_flagX + 2; x++) {
+	          if (x < 0 || x >= mapWidth())
+	            continue;
+	          if (collisionAt(x, y) == COL_SOLID || collisionAt(x, y) == COL_ONEWAY) {
+	            groundTy = y;
+	            foundX = x;
+	            found = true;
+	            break;
+	          }
 	        }
 	      }
+	      // The ground is often 2 tiles thick; align the pole base to the *top*
+	      // of that stack so it doesn't sink a tile into the floor.
+	      while (groundTy > 0) {
+	        uint8_t above = collisionAt(foundX, groundTy - 1);
+	        if (above == COL_SOLID || above == COL_ONEWAY)
+	          groundTy--;
+	        else
+	          break;
+	      }
 	      int poleX = g_flagX * TILE - (int)g_camX;
-	      int poleBottom = (groundY + 1) * TILE;
+	      // Align the pole base to the top of the ground tile.
+	      int poleBottom = groundTy * TILE;
 
+	      // Draw the flag first, then the pole so the pole sits in front of the
+	      // flag and its shadow never overlays the pole.
+	      if (g_texFlag) {
+	        int texW = 0, texH = 0;
+	        SDL_QueryTexture(g_texFlag, nullptr, nullptr, &texW, &texH);
+	        int idx = flagPaletteIndexForTheme(g_theme);
+	        int cols = (texW / 16);
+	        if (cols <= 0)
+	          cols = 1;
+	        int maxIdx = (cols * (texH / 16)) - 1;
+	        if (maxIdx < 0)
+	          maxIdx = 0;
+	        if (idx > maxIdx)
+	          idx = maxIdx;
+	        SDL_Rect src = {(idx % cols) * 16, (idx / cols) * 16, 16, 16};
+	        int attachX = poleX + g_flagPoleShaftX;
+	        SDL_Rect dst = {attachX - 16, (int)g_flagY, 16, 16};
+	        renderCopyWithShadow(g_texFlag, &src, &dst);
+	      }
 	      if (g_texFlagPole) {
 	        int texW = 0, texH = 0;
 	        SDL_QueryTexture(g_texFlagPole, nullptr, nullptr, &texW, &texH);
-	        SDL_Rect src = {0, 0, 16, texH};
+	        int idx = flagPolePaletteIndexForTheme(g_theme);
+	        int maxIdx = (texW / 16) - 1;
+	        if (maxIdx < 0)
+	          maxIdx = 0;
+	        if (idx > maxIdx)
+	          idx = maxIdx;
+	        SDL_Rect src = {idx * 16, 0, 16, texH};
 	        SDL_Rect dst = {poleX, poleBottom - texH, 16, texH};
 	        renderCopyWithShadow(g_texFlagPole, &src, &dst);
-	      }
-	      if (g_texFlag) {
-	        int frame = ((SDL_GetTicks() / 150) % 3);
-	        SDL_Rect src = {frame * 16, 0, 16, 16};
-	        SDL_Rect dst = {poleX - 16, (int)g_flagY, 16, 16};
-	        renderCopyWithShadow(g_texFlag, &src, &dst);
 	      }
 	    }
 
 	    // Castle
-	    g_castleDrawOn = computeCastleDst(g_castleDrawDst);
+	    g_castleDrawOn = computeCastleDst(g_castleDrawDst, g_castleOverlayDst);
 	    if (g_castleDrawOn) {
-	      int topH = (g_castleDrawDst.h > 120) ? 120 : g_castleDrawDst.h;
-	      SDL_Rect srcTop = {0, 0, g_castleDrawDst.w, topH};
-	      SDL_Rect dstTop = g_castleDrawDst;
-	      dstTop.h = topH;
-	      renderCopyWithShadow(g_texCastle, &srcTop, &dstTop);
+	      SDL_Rect srcTop = {0, 0, g_castleDrawDst.w, g_castleDrawDst.h};
+	      renderCopyWithShadow(g_texCastle, &srcTop, &g_castleDrawDst);
 	    }
 
     // Entities
@@ -3085,14 +4805,18 @@ void render() {
           SDL_SetRenderDrawColor(g_ren, 172, 100, 40, 255);
           SDL_RenderFillRect(g_ren, &dst);
         }
-      } else if (e.type == E_KOOPA) {
+      } else if (e.type == E_KOOPA || e.type == E_KOOPA_RED) {
         if (g_texKoopa || g_texKoopaSheet) {
           if (e.state >= 1) {
             dst.h = 16;
             dst.w = 16;
             if (g_texKoopaSheet) {
-              int frame = (e.state == 2) ? ((int)(e.timer * 12) % 4) : 0;
-              SDL_Rect src = {32 + frame * 16, 16, 16, 16};
+              SDL_Rect src = {0, 16, 16, 16};
+              if (e.state == 2) {
+                static const int kSpinX[4] = {16, 32, 48, 0};
+                int frame = ((int)(e.timer * 12) % 4);
+                src.x = kSpinX[frame];
+              }
               renderCopyWithShadow(g_texKoopaSheet, &src, &dst);
             } else if (g_texKoopa) {
               SDL_Rect src = {0, 8, 16, 16};
@@ -3109,6 +4833,77 @@ void render() {
           }
         } else {
           SDL_SetRenderDrawColor(g_ren, 0, 160, 0, 255);
+          SDL_RenderFillRect(g_ren, &dst);
+        }
+      } else if (e.type == E_PLATFORM_SIDEWAYS || e.type == E_PLATFORM_VERTICAL ||
+                 e.type == E_PLATFORM_ROPE) {
+        if (g_texPlatform) {
+          SDL_Rect srcL = {0, 0, 8, 8};
+          SDL_Rect srcM = {8, 0, 8, 8};
+          SDL_Rect srcR = {16, 0, 8, 8};
+
+          SDL_Rect dstL = dst;
+          dstL.w = 8;
+          renderCopyWithShadow(g_texPlatform, &srcL, &dstL);
+          SDL_Rect dstR = dst;
+          dstR.w = 8;
+          dstR.x = dst.x + dst.w - 8;
+          renderCopyWithShadow(g_texPlatform, &srcR, &dstR);
+
+          int midStart = dst.x + 8;
+          int midEnd = dst.x + dst.w - 8;
+          for (int x = midStart; x < midEnd; x += 8) {
+            SDL_Rect dstM = {x, dst.y, 8, dst.h};
+            if (x + 8 > midEnd)
+              dstM.w = midEnd - x;
+            SDL_Rect src = srcM;
+            src.w = dstM.w;
+            renderCopyWithShadow(g_texPlatform, &src, &dstM);
+          }
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 200, 200, 200, 255);
+          SDL_RenderFillRect(g_ren, &dst);
+        }
+      } else if (e.type == E_CHEEP_SWIM || e.type == E_CHEEP_LEAP) {
+        if (g_texCheepCheep) {
+          int frame = ((int)(e.timer * 8) % 2);
+          SDL_Rect src = {frame * 16, 0, 16, 16};
+          SDL_RendererFlip flip =
+              ((e.vx > 0.0f) || (e.dir > 0)) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+          renderCopyExWithShadow(g_texCheepCheep, &src, &dst, flip);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 240, 80, 80, 255);
+          SDL_RenderFillRect(g_ren, &dst);
+        }
+      } else if (e.type == E_BULLET_BILL) {
+        if (g_texBulletBill) {
+          SDL_Rect src = {0, 0, 16, 16};
+          SDL_RendererFlip flip =
+              (e.dir > 0) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+          renderCopyExWithShadow(g_texBulletBill, &src, &dst, flip);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 40, 40, 40, 255);
+          SDL_RenderFillRect(g_ren, &dst);
+        }
+      } else if (e.type == E_CASTLE_AXE) {
+        if (g_texBridgeAxe) {
+          SDL_Rect src = {0, 0, 16, 16};
+          renderCopyWithShadow(g_texBridgeAxe, &src, &dst);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 220, 220, 220, 255);
+          SDL_RenderFillRect(g_ren, &dst);
+        }
+      } else if (e.type == E_BOWSER) {
+        if (g_texBowser) {
+          SDL_Rect src = {0, 0, 48, 48};
+          SDL_Rect drawDst = dst;
+          drawDst.w = 48;
+          drawDst.h = 48;
+          SDL_RendererFlip flip =
+              (e.dir > 0) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+          renderCopyExWithShadow(g_texBowser, &src, &drawDst, flip);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 120, 60, 20, 255);
           SDL_RenderFillRect(g_ren, &dst);
         }
       } else if (e.type == E_MUSHROOM) {
@@ -3130,8 +4925,11 @@ void render() {
         }
       } else if (e.type == E_FIREBALL) {
         if (g_texFireball) {
+          // Fireball art is an 8x8 sprite packed into the top-left of a 16x16
+          // sheet. Draw it centered so rotation doesn't "orbit" around (0,0).
           SDL_Rect src = {0, 0, 8, 8};
-          SDL_Rect drawDst = {dst.x + 4, dst.y + 4, 8, 8};
+          SDL_Rect drawDst = {dst.x + (dst.w - 8) / 2, dst.y + (dst.h - 8) / 2,
+                              8, 8};
           SDL_Point center = {4, 4};
           double angle = fmod(e.timer * 720.0, 360.0);
           renderCopyExWithShadowAngle(g_texFireball, &src, &drawDst, angle,
@@ -3152,60 +4950,75 @@ void render() {
       }
     }
 
-    // Player
-    bool showPlayer = (g_p.invT <= 0 || ((int)(g_p.animT * 8) % 2) == 0);
-    if (!g_p.dead && showPlayer) {
-      int px = (int)(g_p.r.x - g_camX);
-	      int pw = (g_p.power == P_SMALL) ? PLAYER_DRAW_W_SMALL : PLAYER_DRAW_W_BIG;
-	      int ph = (g_p.power == P_SMALL) ? 16 : 32;
-	      int drawW = pw;
-	      int drawH = ph;
-	      int drawX = px + (int)((g_p.r.w - drawW) / 2);
-	      int drawY = (int)g_p.r.y;
-	      if (g_p.crouch && g_p.power >= P_BIG)
-	        drawY -= 16;
-	      SDL_Rect dst = {drawX, drawY, drawW, drawH};
+    // Players
+    for (int pi = 0; pi < g_playerCount; pi++) {
+      Player &pl = g_players[pi];
+      bool showPlayer = (pl.invT <= 0 || ((int)(pl.animT * 8) % 2) == 0);
+      if (pl.dead || !showPlayer)
+        continue;
 
-      // Try to draw sprite texture on top (if it works, it will cover the
-      // fallback)
-      SDL_Texture *tex = g_texPlayerSmall[g_charIndex];
-      if (g_p.power == P_FIRE)
-        tex = g_texPlayerFire[g_charIndex];
-      else if (g_p.power >= P_BIG)
-        tex = g_texPlayerBig[g_charIndex];
+      int px = (int)(pl.r.x - g_camX);
+      int pw = (pl.power == P_SMALL) ? PLAYER_DRAW_W_SMALL : PLAYER_DRAW_W_BIG;
+      int ph = (pl.power == P_SMALL) ? 16 : 32;
+      int drawX = px + (int)((pl.r.w - pw) / 2);
+      int drawY = (int)pl.r.y;
+      if (pl.crouch && pl.power >= P_BIG)
+        drawY -= 16;
+      SDL_Rect dst = {drawX, drawY, pw, ph};
+
+      int ci = g_playerCharIndex[pi] % g_charCount;
+      SDL_Texture *tex = g_texPlayerSmall[ci];
+      if (pl.power == P_FIRE)
+        tex = g_texPlayerFire[ci];
+      else if (pl.power >= P_BIG)
+        tex = g_texPlayerBig[ci];
+
       if (tex) {
+        uint32_t held = g_playerHeld[pi];
+        bool inWaterDraw = rectTouchesLiquid(pl.r);
+        bool swimStroke = inWaterDraw && (pl.swimAnimT < 0.25f);
         bool skidding =
-            g_p.ground &&
-            (((g_held & VPAD_BUTTON_LEFT) && g_p.vx > 20) ||
-             ((g_held & VPAD_BUTTON_RIGHT) && g_p.vx < -20));
-        if (skidding && g_sfxSkid && g_skidCooldown <= 0.0f) {
+            pl.ground && (((held & VPAD_BUTTON_LEFT) && pl.vx > 20) ||
+                          ((held & VPAD_BUTTON_RIGHT) && pl.vx < -20));
+        if (pi == 0 && skidding && g_sfxSkid && g_skidCooldown <= 0.0f) {
           Mix_PlayChannel(-1, g_sfxSkid, 0);
           g_skidCooldown = 0.35f;
         }
+
         int frame = 0;
         SDL_Rect src = {0, 0, 16, 16};
-        if (g_p.power == P_SMALL) {
-          if (!g_p.ground) {
+        if (pl.power == P_SMALL) {
+          if (inWaterDraw) {
+            if (swimStroke) {
+              static const int kSwimSeq[6] = {5, 1, 2, 3, 2, 1};
+              int idx = (int)(pl.swimAnimT * 24.0f) % 6;
+              frame = kSwimSeq[idx];
+            } else {
+              frame = ((int)(pl.animT * 6.0f) % 2) ? 5 : 0;
+            }
+          } else if (!pl.ground) {
             frame = 5;
           } else {
             frame = skidding ? 4
-                             : (fabsf(g_p.vx) > 10
-                                    ? 1 + ((int)(g_p.animT * 10) % 3)
+                             : (fabsf(pl.vx) > 10
+                                    ? 1 + ((int)(pl.animT * 10) % 3)
                                     : 0);
           }
           src = {frame * 16, 0, 16, 16};
-        } else if (g_p.power == P_FIRE) {
+        } else if (pl.power == P_FIRE) {
           int fireFrame = 0;
-          if (g_p.throwT > 0.0f) {
-            fireFrame = g_p.ground ? 7 : 8;
-          } else if (g_p.crouch && g_p.ground) {
+          if (pl.throwT > 0.0f) {
+            fireFrame = pl.ground ? 7 : 8;
+          } else if (pl.crouch) {
             fireFrame = 1;
-          } else if (!g_p.ground) {
+          } else if (inWaterDraw) {
+            fireFrame = swimStroke ? (2 + ((int)(pl.swimAnimT * 14.0f) % 3)) : 6;
+          } else if (!pl.ground) {
             fireFrame = 6;
           } else if (skidding) {
             fireFrame = 5;
-          } else if (fabsf(g_p.vx) > 10) {
-            fireFrame = 2 + ((int)(g_p.animT * 10) % 3);
+          } else if (fabsf(pl.vx) > 10) {
+            fireFrame = 2 + ((int)(pl.animT * 10) % 3);
           } else {
             fireFrame = 0;
           }
@@ -3213,48 +5026,78 @@ void render() {
           src = {frame * 16, 0, 16, 32};
         } else {
           // Big sheet: 0 idle, 1 crouch, 2..4 walk, 5 skid, 6 jump
-          if (g_p.crouch && g_p.ground) {
+          if (pl.crouch) {
             frame = 1;
-          } else if (!g_p.ground) {
+          } else if (inWaterDraw) {
+            frame = swimStroke ? (2 + ((int)(pl.swimAnimT * 14.0f) % 3)) : 6;
+          } else if (!pl.ground) {
             frame = 6;
           } else {
             frame = skidding ? 5
-                             : (fabsf(g_p.vx) > 10
-                                    ? 2 + ((int)(g_p.animT * 10) % 3)
+                             : (fabsf(pl.vx) > 10
+                                    ? 2 + ((int)(pl.animT * 10) % 3)
                                     : 0);
           }
           src = {frame * 16, 0, 16, 32};
         }
 
-        SDL_RendererFlip flip = g_p.right ? SDL_FLIP_NONE : SDL_FLIP_HORIZONTAL;
-        if (g_p.power == P_SMALL) {
+        SDL_RendererFlip flip = pl.right ? SDL_FLIP_NONE : SDL_FLIP_HORIZONTAL;
+        if (pl.power == P_SMALL) {
           renderCopyExWithShadow(tex, &src, &dst, flip);
         } else {
-          // Some backends behave oddly with a single 16x32 blit (showing only the
-          // top half). Split tall sprites into two 16x16 draws.
           renderTall16x32WithShadow(tex, frame * 16, dst, flip);
         }
       } else {
-		        // Fallback rectangle if texture missing
-		        SDL_SetRenderDrawColor(g_ren, 228, 52, 52, 255);
-		        SDL_RenderFillRect(g_ren, &dst);
-	      }
-	    }
+        SDL_SetRenderDrawColor(g_ren, 228, 52, 52, 255);
+        SDL_RenderFillRect(g_ren, &dst);
+      }
+    }
 	    // Castle overlay: hides the player as they enter the door.
-	    if (g_castleDrawOn && g_texCastle && g_castleDrawDst.h > 120) {
-	      int overlayY = 120;
-	      int overlayH = g_castleDrawDst.h - overlayY;
-	      SDL_Rect src = {0, overlayY, g_castleDrawDst.w, overlayH};
-	      SDL_Rect dst = {g_castleDrawDst.x, g_castleDrawDst.y + overlayY,
-	                      g_castleDrawDst.w, overlayH};
-	      SDL_RenderCopy(g_ren, g_texCastle, &src, &dst);
+	    if (g_castleDrawOn && g_texCastle && g_castleOverlayDst.w > 0 &&
+	        g_castleOverlayDst.h > 0) {
+	      constexpr int kOverlayY = 120;
+	      constexpr int kOverlayX = 32;
+	      SDL_Rect src = {kOverlayX, kOverlayY, g_castleOverlayDst.w,
+	                      g_castleOverlayDst.h};
+	      SDL_RenderCopy(g_ren, g_texCastle, &src, &g_castleOverlayDst);
 	    }
-	  if (g_nightMode) {
+	    if (g_nightMode) {
 	    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 	    SDL_SetRenderDrawColor(g_ren, 0, 0, 40, 100);
 	    SDL_Rect night = {0, 0, GAME_W, GAME_H};
     SDL_RenderFillRect(g_ren, &night);
   }
+
+  // Ambient particles: drawn above gameplay, below the cloud overlay + HUD.
+  renderAmbientParticles();
+
+  // Cloud overlay: should sit in front of everything except the HUD.
+  // Only enabled when the level asks for it (or Overworld by default).
+  {
+    bool wantsClouds = g_levelInfo.bgClouds || (g_theme == THEME_OVERWORLD);
+    if (wantsClouds && g_texBgCloudOverlay) {
+      SDL_SetTextureAlphaMod(g_texBgCloudOverlay, 110);
+      // Render only a visible slice of the overlay so it stays aligned to the
+      // viewport and doesn't clip into ground. Shift the sample down so the
+      // clouds read higher in the view.
+      constexpr int kCloudSrcY = 250;
+      SDL_Rect src = {0, kCloudSrcY, 512, GAME_H};
+      // Fore-foreground layer: move *faster* than the world when the camera
+      // pans, plus a slow independent drift.
+      constexpr float kCloudPanMul = 1.08f;
+      constexpr float kCloudDrift = 0.0012f;
+      int drift = (int)(SDL_GetTicks() * kCloudDrift);
+      int off = (int)(g_camX * kCloudPanMul) + drift;
+      int x0 = -(off % 512);
+      SDL_Rect dst = {x0, 0, 512, GAME_H};
+      for (int x = dst.x; x < GAME_W; x += 512) {
+        SDL_Rect d = {x, dst.y, dst.w, dst.h};
+        SDL_RenderCopy(g_ren, g_texBgCloudOverlay, &src, &d);
+      }
+      SDL_SetTextureAlphaMod(g_texBgCloudOverlay, 255);
+    }
+  }
+
   // HUD (SMB-style, drawn directly on the sky)
   {
     SDL_Color white = {255, 255, 255, 255};
@@ -3292,37 +5135,63 @@ void render() {
     const char *timeLabel = "TIME";
     snprintf(buf, sizeof(buf), "%03d", g_time < 0 ? 0 : g_time);
 
-    // Reserve space for lives icon+count at the far right.
-    char livesBuf[16];
-    snprintf(livesBuf, sizeof(livesBuf), "%02d", g_p.lives);
     int lifeSize = 12;
-    int livesW = textWidth(livesBuf, scale);
-    int livesBlockW = lifeSize + 2 + livesW;
+    // Reserve space for a compact lives column at the far right.
+    int livesNumW = textWidth("x00", scale);
+    int pLabelW = textWidth("P4", scale);
+    int livesBlockW = pLabelW + 2 + lifeSize + 2 + livesNumW;
 
     int timeRight = GAME_W - margin - livesBlockW - 10;
     drawTextShadow(timeRight - textWidth(timeLabel, scale), y1, timeLabel, scale,
                    white);
     drawTextShadow(timeRight - textWidth(buf, scale), y2, buf, scale, white);
 
-    // Lives (below time, far right)
-    int iconX = GAME_W - margin - livesBlockW;
-    int iconY = y2 - 1;
-    if (g_texLifeIcon[g_charIndex]) {
-      SDL_Rect dst = {iconX, iconY, lifeSize, lifeSize};
-      SDL_RenderCopy(g_ren, g_texLifeIcon[g_charIndex], nullptr, &dst);
+    // Lives for all active players (far right)
+    int baseX = GAME_W - margin - livesBlockW;
+    int baseY = y2 - 1;
+    for (int pi = 0; pi < g_playerCount; pi++) {
+      Player &pl = g_players[pi];
+      int rowY = baseY + pi * 14;
+      char pLabel[8];
+      snprintf(pLabel, sizeof(pLabel), "P%d", pi + 1);
+      drawTextShadow(baseX, rowY + 1, pLabel, scale, white);
+
+      int ci = g_playerCharIndex[pi] % g_charCount;
+      if (g_texLifeIcon[ci]) {
+        SDL_Rect dst = {baseX + pLabelW + 2, rowY, lifeSize, lifeSize};
+        SDL_RenderCopy(g_ren, g_texLifeIcon[ci], nullptr, &dst);
+      }
+      char livesBuf[16];
+      snprintf(livesBuf, sizeof(livesBuf), "x%02d", pl.lives < 0 ? 0 : pl.lives);
+      drawTextShadow(baseX + pLabelW + 2 + lifeSize + 2, rowY + 1, livesBuf,
+                     scale, white);
     }
-    drawTextShadow(iconX + lifeSize + 2, y2, livesBuf, scale, white);
   }
 
   if (g_state == GS_DEAD || g_state == GS_GAMEOVER) {
     SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 200);
     SDL_Rect overlay = {GAME_W / 4, GAME_H / 3, GAME_W / 2, GAME_H / 3};
     SDL_RenderFillRect(g_ren, &overlay);
+
+    const char *title = (g_state == GS_GAMEOVER) ? "GAME OVER" : "YOU DIED";
+    drawTextShadow((GAME_W - textWidth(title, 2)) / 2, overlay.y + 22, title, 2,
+                   {255, 255, 255, 255});
+    const char *hint = "PRESS A";
+    drawTextShadow((GAME_W - textWidth(hint, 1)) / 2, overlay.y + overlay.h - 28,
+                   hint, 1, {200, 200, 200, 255});
   }
   if (g_state == GS_WIN) {
     SDL_SetRenderDrawColor(g_ren, 0, 100, 0, 200);
     SDL_Rect overlay = {GAME_W / 4, GAME_H / 3, GAME_W / 2, GAME_H / 3};
     SDL_RenderFillRect(g_ren, &overlay);
+
+    const char *title = "COURSE CLEAR";
+    drawTextShadow((GAME_W - textWidth(title, 2)) / 2, overlay.y + 22, title, 2,
+                   {255, 255, 255, 255});
+    char buf[32];
+    snprintf(buf, sizeof(buf), "WORLD %d-%d", g_levelInfo.world, g_levelInfo.stage);
+    drawTextShadow((GAME_W - textWidth(buf, 1)) / 2, overlay.y + 56, buf, 1,
+                   {255, 255, 255, 255});
   }
   if (g_state == GS_PAUSE) {
     SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
@@ -3356,11 +5225,14 @@ void render() {
 int main(int argc, char **argv) {
   WHBProcInit();
   VPADInit();
+  KPADInit();
+  WPADEnableURCC(TRUE);
   SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
   IMG_Init(IMG_INIT_PNG);
   Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 4096);
   Mix_AllocateChannels(32);
   Mix_ReserveChannels(0);
+  srand((unsigned)SDL_GetTicks());
 
   g_win = SDL_CreateWindow("SMB", 0, 0, TV_W, TV_H, SDL_WINDOW_FULLSCREEN);
   g_ren = SDL_CreateRenderer(
@@ -3404,8 +5276,10 @@ int main(int argc, char **argv) {
     } else if (g_state == GS_PAUSE) {
       updatePauseMenu();
     } else if (g_state == GS_PLAYING) {
-      updatePlayer(dt);
+      updatePlatformsAndGenerators(dt);
+      updatePlayers(dt);
       updateEntities(dt);
+      updateAmbientParticles(dt);
       g_timeAcc += dt;
       if (g_timeAcc >= 1.0f) {
         g_timeAcc -= 1.0f;
@@ -3418,6 +5292,9 @@ int main(int argc, char **argv) {
       }
     } else if (g_state == GS_FLAG) {
       updateFlagSequence(dt);
+      updateAmbientParticles(dt);
+      updateCameraFromLeader();
+      enforceNonLeaderPlayersInView();
     } else if (g_state == GS_DEAD) {
       if (g_pressed & VPAD_BUTTON_A) {
         if (g_p.lives > 0)
@@ -3443,6 +5320,7 @@ int main(int argc, char **argv) {
   SDL_DestroyWindow(g_win);
   IMG_Quit();
   SDL_Quit();
+  KPADShutdown();
   WHBProcShutdown();
   return 0;
 }

@@ -42,5 +42,6 @@ bool loadLevelSection(int levelIndex, int sectionIndex,
   out.bgPrimary = section.bgPrimary;
   out.bgSecondary = section.bgSecondary;
   out.bgClouds = section.bgClouds;
+  out.bgParticles = section.bgParticles;
   return true;
 }

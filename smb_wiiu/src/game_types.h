@@ -23,10 +23,30 @@ enum EType {
   E_NONE = 0,
   E_GOOMBA,
   E_KOOPA,
+  E_KOOPA_RED,
   E_MUSHROOM,
   E_FIRE_FLOWER,
   E_FIREBALL,
-  E_COIN_POPUP
+  E_COIN_POPUP,
+
+  // Additional enemies / level objects from the Godot project.
+  E_CHEEP_SWIM,
+  E_CHEEP_LEAP,
+  E_BULLET_BILL,
+  E_BULLET_CANNON,
+  E_BOWSER,
+
+  // Moving platforms.
+  E_PLATFORM_SIDEWAYS,
+  E_PLATFORM_VERTICAL,
+  E_PLATFORM_ROPE,
+
+  // Castle completion trigger (axe at the end of Bowser bridges).
+  E_CASTLE_AXE,
+
+  // Off-screen / trigger-only generators.
+  E_ENTITY_GENERATOR,
+  E_ENTITY_GENERATOR_STOP
 };
 enum LevelTheme {
   THEME_OVERWORLD = 0,

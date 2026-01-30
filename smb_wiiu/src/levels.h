@@ -17,6 +17,8 @@ struct EnemySpawn {
   float x;
   float y;
   int dir;
+  int a;
+  int b;
 };
 
 struct LevelSectionRuntime {
@@ -42,6 +44,7 @@ struct LevelSectionRuntime {
   int bgPrimary;
   int bgSecondary;
   bool bgClouds;
+  int bgParticles;
 };
 
 struct LevelSectionData {
@@ -61,6 +64,7 @@ struct LevelSectionData {
   int bgPrimary;
   int bgSecondary;
   bool bgClouds;
+  int bgParticles;
   const PipeLink *pipes;
   int pipeCount;
   const EnemySpawn *enemies;

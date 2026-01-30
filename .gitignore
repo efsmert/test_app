@@ -1,6 +1,8 @@
 .DS_Store
 *.swp
 *.swo
+*.pyc
+__pycache__/
 
 # Local build artifacts
 build/
@@ -12,3 +14,8 @@ Super Mario Bros. (Japan, USA).nes
 wiiu_platformer.elf
 wiiu_platformer.rpx
 wiiu_platformer.wuhb
+
+# Wii U build outputs
+smb_wiiu/*.elf
+smb_wiiu/*.rpx
+smb_wiiu/*.wuhb
