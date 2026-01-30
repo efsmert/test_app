@@ -701,6 +701,18 @@ def build_levels():
                 tx, ty = to_tile(n.position, x_offset, y_offset)
                 et = "E_KOOPA_RED" if "RedKoopaTroopa.tscn" in res else "E_KOOPA"
                 enemies.append((et, tx * TILE, (ty - 1) * TILE, -1, 0, 0))
+            if "BuzzyBeetle.tscn" in res:
+                tx, ty = to_tile(n.position, x_offset, y_offset)
+                enemies.append(("E_BUZZY_BEETLE", tx * TILE, (ty - 1) * TILE, -1, 0, 0))
+            if "Blooper.tscn" in res:
+                tx, ty = to_tile(n.position, x_offset, y_offset)
+                enemies.append(("E_BLOOPER", tx * TILE, (ty - 1) * TILE, -1, 0, 0))
+            if "HammerBro.tscn" in res:
+                tx, ty = to_tile(n.position, x_offset, y_offset)
+                enemies.append(("E_HAMMER_BRO", tx * TILE, (ty - 1) * TILE, -1, 0, 0))
+            if "Lakitu.tscn" in res:
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                enemies.append(("E_LAKITU", wx, wy, -1, 0, 0))
 
             if "CheepCheep.tscn" in res:
                 # Underwater Cheep-Cheeps (Green/Red).
@@ -716,6 +728,9 @@ def build_levels():
                 wx, wy = to_world_px(n.position, x_offset, y_offset)
                 plat_w = 32 if "SmallVerticalPlatform.tscn" in res else 48
                 enemies.append(("E_PLATFORM_VERTICAL", wx - plat_w / 2, wy, 0, plat_w, 0))
+            if "FallingPlatform.tscn" in res:
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                enemies.append(("E_PLATFORM_FALLING", wx - 24, wy, 0, 48, 0))
 
             # Classic SMB elevators in 1-2 (wrap between top..bottom).
             if "ElevatorPlatform.tscn" in res:
@@ -742,6 +757,9 @@ def build_levels():
             if res.endswith("EntityGeneratorStopper.tscn"):
                 wx, wy = to_world_px(n.position, x_offset, y_offset)
                 enemies.append(("E_ENTITY_GENERATOR_STOP", wx, wy, 0, 0, 0))
+            if res.endswith("BulletBillCannon.tscn"):
+                wx, wy = to_world_px(n.position, x_offset, y_offset)
+                enemies.append(("E_BULLET_CANNON", wx, wy, 0, 0, 0))
 
             # Castle completion (axe) + Bowser.
             if res.endswith("CastleBridge.tscn"):

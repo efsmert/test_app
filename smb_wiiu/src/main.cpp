@@ -46,6 +46,7 @@ enum TitleMode {
   TITLE_OPTIONS = 2,
   TITLE_EXTRAS = 3,
   TITLE_MULTI_SELECT = 4,
+  TITLE_CHEATS = 5,
 };
 constexpr uint8_t COL_NONE = 0;
 constexpr uint8_t COL_SOLID = 1;
@@ -105,6 +106,8 @@ static int g_sectionIndex = 0;
 static LevelSectionRuntime g_levelInfo = {};
 static bool g_allowCameraBacktrack = false;
 static bool g_multiplayerActive = false;
+static bool g_cheatMoonJump = false;
+static bool g_cheatGodMode = false;
 static int g_playerCount = 1;
 static int g_playerCharIndex[4] = {0, 0, 0, 0};
 static bool g_playerReady[4] = {false, false, false, false};
@@ -129,6 +132,13 @@ static SDL_Texture *g_texKoopa = nullptr;
 static SDL_Texture *g_texKoopaSheet = nullptr;
 static SDL_Texture *g_texCheepCheep = nullptr;
 static SDL_Texture *g_texBulletBill = nullptr;
+static SDL_Texture *g_texBlooper = nullptr;
+static SDL_Texture *g_texBuzzy = nullptr;
+static SDL_Texture *g_texLakitu = nullptr;
+static SDL_Texture *g_texLakituCloud = nullptr;
+static SDL_Texture *g_texSpiny = nullptr;
+static SDL_Texture *g_texHammerBro = nullptr;
+static SDL_Texture *g_texHammer = nullptr;
 static SDL_Texture *g_texBowser = nullptr;
 static SDL_Texture *g_texPlatform = nullptr;
 static SDL_Texture *g_texBridgeAxe = nullptr;
@@ -164,6 +174,7 @@ static int g_menuIndex = 0;
 static int g_playerMenuIndex[4] = {0, 0, 0, 0};
 static int g_titleMode = TITLE_MAIN;
 static int g_optionsIndex = 0;
+static int g_cheatsIndex = 0;
 static int g_mainMenuIndex = 0;
 static int g_pauseIndex = 0;
 static const char *g_pauseOptions[] = {"RESUME", "NEXT LEVEL", "PREVIOUS LEVEL",
@@ -688,8 +699,9 @@ bool overlap(const Rect &a, const Rect &b) {
 static Rect enemyHitRect(const Entity &e) {
   Rect r = e.r;
   // Match classic SMB-ish stomp feel: treat tall enemies as a 16x16 hitbox
-  // anchored to their feet.
-  if ((e.type == E_KOOPA || e.type == E_KOOPA_RED) && e.state == 0) {
+  // anchored to their feet. This also normalizes collision across enemies so
+  // Koopa/Buzzy/Lakitu/etc don't feel "fatter" than Goombas.
+  if (r.h > 16.0f) {
     r.y = r.y + (r.h - 16.0f);
     r.h = 16.0f;
   }
@@ -726,6 +738,12 @@ float standHeightForPower(Power p) {
 
 static bool cameraBacktrackEnabled() {
   return g_multiplayerActive || g_allowCameraBacktrack;
+}
+
+// Returns true if the player should ignore enemy/projectile damage.
+// Pit death is handled separately and is intentionally not affected by cheats.
+static bool playerIsInvulnerable(const Player &pl) {
+  return g_cheatGodMode || pl.invT > 0.0f;
 }
 
 static int autoPrimaryBgForTheme() {
@@ -931,9 +949,42 @@ SDL_Texture *loadTex(const char *file) {
   if (!s)
     return nullptr;
 
+  auto surfaceCornerIsChromaGreen = [](SDL_Surface *surf) -> bool {
+    if (!surf || surf->w <= 0 || surf->h <= 0 || !surf->pixels || !surf->format)
+      return false;
+    const int x = 0;
+    const int y = 0;
+    const int bpp = surf->format->BytesPerPixel;
+    const uint8_t *p = (const uint8_t *)surf->pixels + y * surf->pitch + x * bpp;
+    Uint32 pixel = 0;
+    switch (bpp) {
+    case 1:
+      pixel = *p;
+      break;
+    case 2:
+      pixel = *(const Uint16 *)p;
+      break;
+    case 3:
+      if (SDL_BYTEORDER == SDL_BIG_ENDIAN)
+        pixel = (p[0] << 16) | (p[1] << 8) | p[2];
+      else
+        pixel = p[0] | (p[1] << 8) | (p[2] << 16);
+      break;
+    default:
+      pixel = *(const Uint32 *)p;
+      break;
+    }
+    Uint8 r = 0, g = 0, b = 0, a = 0;
+    SDL_GetRGBA(pixel, surf->format, &r, &g, &b, &a);
+    return (r == 0 && g == 255 && b == 0);
+  };
+
   // Prefer PNG alpha when present; fall back to bright-green chroma key for
-  // legacy placeholder sheets.
+  // legacy placeholder sheets. Some Godot-exported PNGs keep an unused alpha
+  // channel while still using bright-green backgrounds; detect that via the
+  // top-left pixel so enemy/FX sheets don't render as solid green.
   if (s->format->Amask == 0 ||
+      surfaceCornerIsChromaGreen(s) ||
       (strstr(file, "tilesets/Deco/") != nullptr) ||
       (strstr(file, "sprites/tilesets/Deco/") != nullptr) ||
       (strstr(file, "sprites/ui/TitleSMB1.png") != nullptr) ||
@@ -980,8 +1031,39 @@ SDL_Texture *loadTexScaled(const char *file, int outW, int outH) {
   if (!s)
     return nullptr;
 
+  auto surfaceCornerIsChromaGreen = [](SDL_Surface *surf) -> bool {
+    if (!surf || surf->w <= 0 || surf->h <= 0 || !surf->pixels || !surf->format)
+      return false;
+    const int x = 0;
+    const int y = 0;
+    const int bpp = surf->format->BytesPerPixel;
+    const uint8_t *p = (const uint8_t *)surf->pixels + y * surf->pitch + x * bpp;
+    Uint32 pixel = 0;
+    switch (bpp) {
+    case 1:
+      pixel = *p;
+      break;
+    case 2:
+      pixel = *(const Uint16 *)p;
+      break;
+    case 3:
+      if (SDL_BYTEORDER == SDL_BIG_ENDIAN)
+        pixel = (p[0] << 16) | (p[1] << 8) | p[2];
+      else
+        pixel = p[0] | (p[1] << 8) | (p[2] << 16);
+      break;
+    default:
+      pixel = *(const Uint32 *)p;
+      break;
+    }
+    Uint8 r = 0, g = 0, b = 0, a = 0;
+    SDL_GetRGBA(pixel, surf->format, &r, &g, &b, &a);
+    return (r == 0 && g == 255 && b == 0);
+  };
+
   // Apply the same chroma-key rules as loadTex().
   if (s->format->Amask == 0 ||
+      surfaceCornerIsChromaGreen(s) ||
       (strstr(file, "tilesets/Deco/") != nullptr) ||
       (strstr(file, "sprites/tilesets/Deco/") != nullptr) ||
       (strstr(file, "sprites/ui/TitleSMB1.png") != nullptr) ||
@@ -1486,6 +1568,13 @@ void loadAssets() {
   g_texKoopaSheet = loadTex("sprites/enemies/KoopaTroopaSheet.png");
   g_texCheepCheep = loadTex("sprites/enemies/CheepCheep.png");
   g_texBulletBill = loadTex("sprites/enemies/BulletBill.png");
+  g_texBlooper = loadTex("sprites/enemies/Blooper.png");
+  g_texBuzzy = loadTex("sprites/enemies/BuzzyBeetle.png");
+  g_texLakitu = loadTex("sprites/enemies/Lakitu.png");
+  g_texLakituCloud = loadTex("sprites/enemies/LakituCloud.png");
+  g_texSpiny = loadTex("sprites/enemies/Spiny.png");
+  g_texHammerBro = loadTex("sprites/enemies/HammerBro.png");
+  g_texHammer = loadTex("sprites/items/Hammer.png");
   g_texBowser = loadTex("sprites/enemies/Bowser.png");
   g_texPlatform = loadTex("sprites/tilesets/Platform.png");
   g_texBridgeAxe = loadTex("sprites/items/BridgeAxe.png");
@@ -1667,12 +1756,55 @@ void spawnEnemiesFromLevel() {
         e.dir = -1;
       break;
     }
+    case E_BUZZY_BEETLE: {
+      e.r = {s.x, s.y, 16.0f, 16.0f};
+      e.vx = -Physics::ENEMY_SPEED;
+      if (e.dir == 0)
+        e.dir = -1;
+      break;
+    }
+    case E_BLOOPER: {
+      // Blooper frames are 16x24; keep the hitbox aligned to that size.
+      e.r = {s.x, s.y, 16.0f, 24.0f};
+      if (e.dir == 0)
+        e.dir = -1;
+      break;
+    }
+    case E_LAKITU: {
+      // Lakitu floats; treat y as its top.
+      e.r = {s.x, s.y, 16.0f, 24.0f};
+      e.baseY = s.y;
+      if (e.dir == 0)
+        e.dir = -1;
+      break;
+    }
+    case E_HAMMER_BRO: {
+      // Hammer Bros are 16x24 sprites standing on blocks.
+      e.r = {s.x, s.y - 8.0f, 16.0f, 24.0f};
+      if (e.dir == 0)
+        e.dir = -1;
+      break;
+    }
     case E_CHEEP_SWIM:
     case E_CHEEP_LEAP:
     case E_BULLET_BILL: {
       e.r = {s.x, s.y, 16.0f, 16.0f};
       if (e.type == E_BULLET_BILL && e.dir == 0)
         e.dir = -1;
+      break;
+    }
+    case E_SPINY: {
+      e.r = {s.x, s.y, 16.0f, 16.0f};
+      if (e.dir == 0)
+        e.dir = -1;
+      break;
+    }
+    case E_BULLET_CANNON: {
+      // Cannon is a logic-only emitter; the visible cannon is part of the
+      // terrain tileset in the upstream levels.
+      e.r = {s.x, s.y, 0.0f, 0.0f};
+      e.state = 0;
+      e.timer = 0.0f;
       break;
     }
     case E_PLATFORM_SIDEWAYS: {
@@ -1703,10 +1835,22 @@ void spawnEnemiesFromLevel() {
       e.baseY = s.y;
       break;
     }
+    case E_PLATFORM_FALLING: {
+      float w = (float)((s.a > 0) ? s.a : 48);
+      e.r = {s.x, s.y, w, 8.0f};
+      e.baseX = s.x;
+      e.baseY = s.y;
+      e.state = 0; // waiting
+      break;
+    }
     case E_ENTITY_GENERATOR:
     case E_ENTITY_GENERATOR_STOP: {
       e.r = {s.x, s.y, 0.0f, 0.0f};
       e.state = 0; // inactive
+      // Track the player's last X so activation matches Godot's
+      // PlayerDetection (crossing the trigger once, not "player is >= x").
+      e.prevX = g_p.r.x + g_p.r.w * 0.5f;
+      e.timer = 0.0f;
       break;
     }
     case E_CASTLE_AXE: {
@@ -2394,7 +2538,7 @@ void updateTitle() {
     break;
   }
   case TITLE_OPTIONS: {
-    constexpr int kOptCount = 3;
+    constexpr int kOptCount = 4; // random theme, night mode, backtrack, cheats
     if (g_pressed & VPAD_BUTTON_UP) {
       g_optionsIndex = (g_optionsIndex + kOptCount - 1) % kOptCount;
       if (g_sfxMenuMove)
@@ -2406,6 +2550,7 @@ void updateTitle() {
     }
 
     if (g_pressed & VPAD_BUTTON_A) {
+      bool forcedBacktrack = g_multiplayerActive;
       if (g_optionsIndex == 0) {
         g_randomTheme = !g_randomTheme;
         if (g_randomTheme)
@@ -2413,7 +2558,11 @@ void updateTitle() {
       } else if (g_optionsIndex == 1) {
         g_nightMode = !g_nightMode;
       } else if (g_optionsIndex == 2) {
-        g_allowCameraBacktrack = !g_allowCameraBacktrack;
+        if (!forcedBacktrack)
+          g_allowCameraBacktrack = !g_allowCameraBacktrack;
+      } else if (g_optionsIndex == 3) {
+        g_titleMode = TITLE_CHEATS;
+        g_cheatsIndex = 0;
       }
       if (g_sfxMenuMove)
         Mix_PlayChannel(-1, g_sfxMenuMove, 0);
@@ -2421,6 +2570,35 @@ void updateTitle() {
 
     if (g_pressed & VPAD_BUTTON_B) {
       g_titleMode = TITLE_MAIN;
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    }
+    break;
+  }
+  case TITLE_CHEATS: {
+    constexpr int kCheatCount = 2; // moonjump, godmode
+    if (g_pressed & VPAD_BUTTON_UP) {
+      g_cheatsIndex = (g_cheatsIndex + kCheatCount - 1) % kCheatCount;
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    } else if (g_pressed & VPAD_BUTTON_DOWN) {
+      g_cheatsIndex = (g_cheatsIndex + 1) % kCheatCount;
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    }
+
+    if (g_pressed & VPAD_BUTTON_A) {
+      if (g_cheatsIndex == 0) {
+        g_cheatMoonJump = !g_cheatMoonJump;
+      } else if (g_cheatsIndex == 1) {
+        g_cheatGodMode = !g_cheatGodMode;
+      }
+      if (g_sfxMenuMove)
+        Mix_PlayChannel(-1, g_sfxMenuMove, 0);
+    }
+
+    if (g_pressed & VPAD_BUTTON_B) {
+      g_titleMode = TITLE_OPTIONS;
       if (g_sfxMenuMove)
         Mix_PlayChannel(-1, g_sfxMenuMove, 0);
     }
@@ -2621,7 +2799,8 @@ static void updatePlatformsAndGenerators(float dt) {
     if (!e.on)
       continue;
 
-    if (e.type != E_PLATFORM_SIDEWAYS && e.type != E_PLATFORM_VERTICAL)
+    if (e.type != E_PLATFORM_SIDEWAYS && e.type != E_PLATFORM_VERTICAL &&
+        e.type != E_PLATFORM_FALLING)
       continue;
 
     e.prevX = e.r.x;
@@ -2667,6 +2846,34 @@ static void updatePlatformsAndGenerators(float dt) {
           e.r.y = topY;
         if (vdir < 0 && e.r.y < topY)
           e.r.y = bottomY;
+      }
+    } else if (e.type == E_PLATFORM_FALLING) {
+      // Falling platforms drop while a player is standing on them (Godot:
+      // FallingPlatform.gd). They do not reset on their own.
+      bool stood = false;
+      for (int pi = 0; pi < g_playerCount; pi++) {
+        const Player &pl = g_players[pi];
+        if (pl.dead)
+          continue;
+        float bottom = pl.r.y + pl.r.h;
+        if (fabsf(bottom - e.prevY) > 0.75f)
+          continue;
+        if (!pl.ground)
+          continue;
+        if (pl.r.x + pl.r.w <= e.prevX + 0.5f)
+          continue;
+        if (pl.r.x >= e.prevX + e.r.w - 0.5f)
+          continue;
+        // Require the player to be slightly above the platform top (matches
+        // the upstream y-4 check) so side contacts don't trigger falling.
+        if (pl.r.y - 4.0f > e.prevY)
+          continue;
+        stood = true;
+        break;
+      }
+      if (stood) {
+        constexpr float kFallSpeed = 96.0f;
+        e.r.y += kFallSpeed * dt;
       }
     }
 
@@ -2827,25 +3034,33 @@ static void updatePlatformsAndGenerators(float dt) {
     if (g.type != E_ENTITY_GENERATOR && g.type != E_ENTITY_GENERATOR_STOP)
       continue;
 
-    // Generators are driven by Player 1 to match the upstream "player detection" trigger.
+    // Generators are driven by Player 1 to match the upstream "player detection"
+    // trigger. Use a crossing test instead of `playerX >= baseX`, otherwise
+    // "stopper" nodes would immediately re-activate generators behind the
+    // player (Godot only triggers on area enter).
     float playerX = g_p.r.x + g_p.r.w * 0.5f;
+    float prevPlayerX = g.prevX;
+    g.prevX = playerX;
+    bool crossed = (prevPlayerX < g.baseX - 8.0f) && (playerX >= g.baseX - 8.0f);
     if (g.type == E_ENTITY_GENERATOR_STOP) {
-      if (g.state == 0 && playerX >= g.baseX - 8.0f) {
+      if (g.state == 0 && crossed) {
         g.state = 1;
-        // Disable all generators for the rest of this section.
+        // Deactivate all generators, but allow those further right to be
+        // activated again when the player reaches them (matches Godot's
+        // `deactivate_all_generators()` behavior).
         for (int j = 0; j < 64; j++) {
-          if (g_ents[j].on && g_ents[j].type == E_ENTITY_GENERATOR)
-            g_ents[j].state = 2; // permanently disabled
+          if (!g_ents[j].on || g_ents[j].type != E_ENTITY_GENERATOR)
+            continue;
+          g_ents[j].state = 0;
+          g_ents[j].timer = 0.0f;
+          g_ents[j].prevX = playerX;
         }
       }
       continue;
     }
 
-    if (g.state == 2)
-      continue;
-
     if (g.state == 0) {
-      if (playerX < g.baseX - 8.0f)
+      if (!crossed)
         continue;
       g.state = 1;
       g.timer = 0.0f;
@@ -2880,7 +3095,11 @@ static void updatePlatformsAndGenerators(float dt) {
           e.dir = -1;
           e.vx = 90.0f;
         } else if (e.type == E_CHEEP_LEAP) {
-          float x = g_camX + (GAME_W * 0.5f) - (float)(32 * (1 + (rand() % 4)));
+          // Spawn within/around the current camera view so leaping fish can
+          // appear both in front of and behind the player (classic "fish
+          // jumping all around the screen" feel).
+          int span = GAME_W + 64; // -32..(GAME_W+31)
+          float x = g_camX + (float)((rand() % span) - 32);
           float surface = liquidSurfaceYAtWorldX(x);
           e.r = {x, surface - 16.0f, 16.0f, 16.0f};
           e.dir = (rand() & 1) ? -1 : 1;
@@ -2912,7 +3131,8 @@ static void updatePlatformsAndGenerators(float dt) {
           e.dir = -1;
           e.vx = 90.0f;
         } else if (e.type == E_CHEEP_LEAP) {
-          float x = g_camX + (GAME_W * 0.5f) - (float)(32 * (1 + (rand() % 4)));
+          int span = GAME_W + 64;
+          float x = g_camX + (float)((rand() % span) - 32);
           float surface = liquidSurfaceYAtWorldX(x);
           e.r = {x, surface - 16.0f, 16.0f, 16.0f};
           e.dir = (rand() & 1) ? -1 : 1;
@@ -3174,6 +3394,14 @@ static void updateOnePlayer(int playerIndex, float dt) {
     pl.swimAnimT = 0.0f;
     if (g_sfxJump)
       Mix_PlayChannel(-1, g_sfxJump, 0);
+  } else if (g_cheatMoonJump && jumpPressed(pressed) && !pl.ground && !inWater) {
+    // Moonjump cheat: allow mid-air jumps (useful for testing unimplemented
+    // sections). This intentionally does not bypass pit death.
+    pl.vy = -Physics::JUMP_HEIGHT;
+    pl.jumping = true;
+    pl.ground = false;
+    if (g_sfxJump)
+      Mix_PlayChannel(-1, g_sfxJump, 0);
   } else if (jumpPressed(pressed) && pl.ground) {
     float jumpHeight = Physics::JUMP_HEIGHT;
     if (fabsf(pl.vx) > Physics::WALK_SPEED * 0.9f)
@@ -3355,7 +3583,7 @@ static void updateOnePlayer(int playerIndex, float dt) {
         if (!pf.on)
           continue;
         if (pf.type != E_PLATFORM_SIDEWAYS && pf.type != E_PLATFORM_VERTICAL &&
-            pf.type != E_PLATFORM_ROPE)
+            pf.type != E_PLATFORM_ROPE && pf.type != E_PLATFORM_FALLING)
           continue;
         float platTop = pf.r.y;
         if (prevBottom > platTop + 0.1f)
@@ -3563,7 +3791,7 @@ void updateEntities(float dt) {
                 Mix_PlayChannel(-1, g_sfxStomp, 0);
               else if (g_sfxKick)
                 Mix_PlayChannel(-1, g_sfxKick, 0);
-            } else if (pl.invT <= 0) {
+            } else if (!playerIsInvulnerable(pl)) {
               if (pl.power > P_SMALL) {
                 pl.power = P_SMALL;
                 pl.crouch = false;
@@ -3654,7 +3882,7 @@ void updateEntities(float dt) {
               e.timer = 0;
               e.dir = 0;
             }
-          } else if (pl.invT <= 0) {
+          } else if (!playerIsInvulnerable(pl)) {
             if (e.state == 1) {
               e.state = 2;
               e.timer = 0;
@@ -3676,6 +3904,561 @@ void updateEntities(float dt) {
             } else {
               pl.invT = 2.0f;
               pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
+        }
+      }
+    } else if (e.type == E_BUZZY_BEETLE) {
+      // Buzzy Beetle: Koopa-like behavior, but uses a 16x16 body. State:
+      // 0=walk, 1=shell idle, 2=shell moving.
+      float moveSpeed = 0.0f;
+      if (e.state == 0)
+        moveSpeed = Physics::ENEMY_SPEED;
+      else if (e.state == 2)
+        moveSpeed = Physics::RUN_SPEED;
+
+      e.r.x += e.dir * moveSpeed * dt;
+      e.vy += 15.0f;
+      e.r.y += e.vy * dt;
+
+      int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
+      int bottomTy = (int)((e.r.y + e.r.h) / TILE);
+      {
+        uint8_t col = collisionAt(midTx, bottomTy);
+        if (col == COL_SOLID || col == COL_ONEWAY) {
+          if (col == COL_ONEWAY) {
+            float prevBottom = (e.r.y - (e.vy * dt)) + e.r.h;
+            float tileTop = bottomTy * TILE;
+            if (prevBottom > tileTop + 0.1f)
+              col = COL_NONE;
+          }
+          if (col != COL_NONE) {
+            e.r.y = bottomTy * TILE - e.r.h;
+            e.vy = 0;
+          }
+        }
+      }
+
+      int frontTx =
+          e.dir > 0 ? (int)((e.r.x + e.r.w) / TILE) : (int)(e.r.x / TILE);
+      int frontTy = (int)((e.r.y + e.r.h - 1) / TILE);
+      if (solidAt(frontTx, frontTy))
+        e.dir = -e.dir;
+
+      if (e.r.x < g_camX - 64 || e.r.y > GAME_H + 32) {
+        e.on = false;
+        continue;
+      }
+
+      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
+
+          bool stomp = playerStomp(pl);
+          if (stomp) {
+            pl.vy = jumpHeld(g_playerHeld[pi]) ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                               : -Physics::BOUNCE_HEIGHT;
+            if (g_sfxStomp)
+              Mix_PlayChannel(-1, g_sfxStomp, 0);
+
+            if (e.state == 0) {
+              e.state = 1;
+              e.timer = 0.0f;
+              e.dir = 0;
+            } else if (e.state == 2) {
+              e.state = 1;
+              e.timer = 0.0f;
+              e.dir = 0;
+            }
+          } else if (!playerIsInvulnerable(pl)) {
+            if (e.state == 1) {
+              e.state = 2;
+              e.timer = 0.0f;
+              e.dir = (pl.r.x < e.r.x) ? 1 : -1;
+              if (g_sfxKick)
+                Mix_PlayChannel(-1, g_sfxKick, 0);
+            } else if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
+        }
+      }
+    } else if (e.type == E_BULLET_CANNON) {
+      // BulletBillCannon (Godot: BulletBillCannon.gd): periodic emitter with a
+      // limit on active bullets.
+      if (e.a <= 0)
+        e.a = 15; // countdown "ticks"
+      if ((rand() % 9) == 8)
+        e.a -= 1;
+      if (e.a > 0)
+        continue;
+
+      // Reset timer (hard-mode cadence isn't modeled here).
+      e.a = 15;
+
+      // Only shoot when player isn't inside the cannon's detect box.
+      if (fabsf((g_p.r.x + g_p.r.w * 0.5f) - e.baseX) < 24.0f &&
+          fabsf((g_p.r.y + g_p.r.h * 0.5f) - e.baseY) < 24.0f) {
+        continue;
+      }
+
+      // Keep at most 3 active bullet bills.
+      int activeBills = 0;
+      for (int j = 0; j < 64; j++) {
+        if (g_ents[j].on && g_ents[j].type == E_BULLET_BILL)
+          activeBills++;
+      }
+      if (activeBills >= 3)
+        continue;
+
+      int dir = (int)copysignf(1.0f, (g_p.r.x + g_p.r.w * 0.5f) - e.baseX);
+      if (dir == 0)
+        dir = 1;
+
+      // Simple block check: don't shoot if a solid tile is directly in front.
+      int tx = (int)(e.baseX / TILE);
+      int ty = (int)((e.baseY + 8.0f) / TILE);
+      if (solidAt(tx + dir, ty))
+        continue;
+
+      int slot = findFreeEntitySlot();
+      if (slot >= 0) {
+        Entity &b = g_ents[slot];
+        b = {};
+        b.on = true;
+        b.type = E_BULLET_BILL;
+        b.dir = dir;
+        b.vx = 100.0f * (float)dir;
+        b.r = {e.baseX + (float)(8 * dir), e.baseY + 8.0f, 16.0f, 16.0f};
+      }
+    } else if (e.type == E_HAMMER_BRO) {
+      // Hammer Bro: patrols a bit, jumps between nearby platforms, and throws hammers.
+      // State: 0=idle/walk anim, 1=throw anim (short).
+      if (e.dir == 0)
+        e.dir = (rand() & 1) ? 1 : -1;
+      if (e.vx == 0.0f)
+        e.vx = 18.0f + (float)(rand() % 10);
+
+      // Gentle horizontal drift so it can walk off / reach ledges.
+      e.r.x += (float)e.dir * e.vx * dt;
+
+      // Bounce off walls.
+      int midTy = (int)((e.r.y + e.r.h * 0.5f) / TILE);
+      int frontTx =
+          (e.dir > 0) ? (int)((e.r.x + e.r.w) / TILE) : (int)(e.r.x / TILE);
+      if (solidAt(frontTx, midTy)) {
+        e.dir = -e.dir;
+        e.r.x += (float)e.dir * e.vx * dt;
+      }
+
+      e.vy += 15.0f;
+      e.r.y += e.vy * dt;
+      int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
+      int bottomTy = (int)((e.r.y + e.r.h) / TILE);
+      uint8_t landedOn = COL_NONE;
+      {
+        uint8_t col = collisionAt(midTx, bottomTy);
+        if (col == COL_SOLID || col == COL_ONEWAY) {
+          if (col == COL_ONEWAY) {
+            float prevBottom = (e.r.y - (e.vy * dt)) + e.r.h;
+            float tileTop = bottomTy * TILE;
+            if (prevBottom > tileTop + 0.1f)
+              col = COL_NONE;
+          }
+          if (col != COL_NONE) {
+            e.r.y = bottomTy * TILE - e.r.h;
+            e.vy = 0.0f;
+            landedOn = col;
+          }
+        }
+      }
+
+      // Occasional jump when on "ground".
+      bool onGround = (e.vy == 0.0f);
+      if (onGround) {
+        // Edge behavior: usually reverse at the edge, but sometimes keep going so the
+        // bro can fall down to a lower platform (requested "jump down" behavior).
+        int footTy = (int)((e.r.y + e.r.h + 1.0f) / TILE);
+        int aheadTx =
+            (e.dir > 0) ? (int)((e.r.x + e.r.w + 1.0f) / TILE) : (int)((e.r.x - 1.0f) / TILE);
+        uint8_t under = collisionAt(aheadTx, footTy);
+        if (under == COL_NONE) {
+          if ((rand() % 5) != 0) {
+            e.dir = -e.dir;
+          }
+        }
+
+        // Small horizontal randomness while grounded.
+        if ((rand() % 240) == 0) {
+          e.dir = (rand() & 1) ? 1 : -1;
+          e.vx = 16.0f + (float)(rand() % 14);
+        }
+
+        // Jump logic: prefer a "high" jump if there is a platform above within a few tiles.
+        bool hasAbove = false;
+        for (int dy = 2; dy <= 4; dy++) {
+          uint8_t above = collisionAt(midTx, bottomTy - dy);
+          if (above == COL_SOLID || above == COL_ONEWAY) {
+            hasAbove = true;
+            break;
+          }
+        }
+
+        if ((rand() % 220) == 0) {
+          e.vy = hasAbove ? -310.0f : ((rand() & 1) ? -240.0f : -150.0f);
+        } else if (landedOn == COL_ONEWAY && (rand() % 360) == 0) {
+          // Short hop with a bit more speed to help it leave a one-way platform.
+          e.vy = -120.0f;
+          e.vx = 40.0f + (float)(rand() % 25);
+        }
+      }
+
+      // Throw cadence: burst a few hammers, then wait.
+      if (e.b <= 0)
+        e.b = 60 + (rand() % 120); // frames-ish until next burst
+      e.b -= 1;
+      if (e.b == 0) {
+        e.a = 2 + (rand() % 5); // throw count remaining
+      }
+      if (e.a > 0) {
+        // Throw one hammer every ~0.25s.
+        if (e.timer >= 0.25f) {
+          e.timer = 0.0f;
+          int slot = findFreeEntitySlot();
+          if (slot >= 0) {
+            int dir = (g_p.r.x + g_p.r.w * 0.5f >= e.r.x) ? 1 : -1;
+            Entity &h = g_ents[slot];
+            h = {};
+            h.on = true;
+            h.type = E_HAMMER;
+            h.dir = dir;
+            h.r = {e.r.x + 8.0f, e.r.y + 8.0f, 16.0f, 16.0f};
+            h.vx = 110.0f * (float)dir;
+            h.vy = -260.0f;
+          }
+          e.state = 1;
+          e.a -= 1;
+        }
+      } else if (e.state == 1 && e.timer >= 0.2f) {
+        // Return to idle visuals after the throw frame.
+        e.state = 0;
+      }
+
+      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
+          if (playerStomp(pl)) {
+            e.on = false;
+            pl.vy = jumpHeld(g_playerHeld[pi]) ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                               : -Physics::BOUNCE_HEIGHT;
+            pl.score += 200;
+            if (g_sfxStomp)
+              Mix_PlayChannel(-1, g_sfxStomp, 0);
+          } else if (!playerIsInvulnerable(pl)) {
+            if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
+        }
+      }
+    } else if (e.type == E_HAMMER) {
+      // Hammer projectile: arc, die on collision, hurts players.
+      constexpr float kGravity = 450.0f;
+      e.r.x += e.vx * dt;
+      e.vy += kGravity * dt;
+      e.r.y += e.vy * dt;
+
+      int midTx = (int)((e.r.x + e.r.w * 0.5f) / TILE);
+      int midTy = (int)((e.r.y + e.r.h * 0.5f) / TILE);
+      if (solidAt(midTx, midTy)) {
+        e.on = false;
+        continue;
+      }
+      if (e.r.x < g_camX - 96 || e.r.x > g_camX + GAME_W + 96 ||
+          e.r.y > GAME_H + 64) {
+        e.on = false;
+        continue;
+      }
+      for (int pi = 0; pi < g_playerCount; pi++) {
+        Player &pl = g_players[pi];
+        if (pl.dead || !overlap(pl.r, e.r))
+          continue;
+        if (playerIsInvulnerable(pl))
+          break;
+        if (pl.power > P_SMALL) {
+          pl.power = P_SMALL;
+          pl.crouch = false;
+          setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+          pl.invT = 2.0f;
+          if (g_sfxDamage)
+            Mix_PlayChannel(-1, g_sfxDamage, 0);
+        } else if (pi == 0) {
+          pl.dead = true;
+          pl.lives--;
+          g_state = GS_DEAD;
+          Mix_HaltMusic();
+        } else {
+          pl.invT = 2.0f;
+        }
+        break;
+      }
+    } else if (e.type == E_LAKITU) {
+      // Lakitu hovers near the top and tosses spinies.
+      // `state` is used only for visuals: 0=idle, 1=throw (brief).
+      if (e.state == 1 && e.timer >= 0.25f) {
+        e.state = 0;
+      }
+      float playerX = g_p.r.x + g_p.r.w * 0.5f;
+      float targetX = playerX + 64.0f;
+      float dx = targetX - (e.r.x + 8.0f);
+      float speed = 0.0f;
+      if (fabsf(dx) > 16.0f) {
+        speed = fmaxf(48.0f, fabsf(dx) * 2.0f);
+        if (speed > 160.0f)
+          speed = 160.0f;
+        e.dir = (dx > 0.0f) ? 1 : -1;
+      }
+      e.r.x += (float)e.dir * speed * dt;
+      e.r.y = e.baseY;
+
+      // Throw spiny if under cap.
+      int spinyCount = 0;
+      for (int j = 0; j < 64; j++) {
+        if (g_ents[j].on && g_ents[j].type == E_SPINY)
+          spinyCount++;
+      }
+      if (spinyCount < 3) {
+        if (e.a <= 0)
+          e.a = 120 + (rand() % 180);
+        e.a -= 1;
+        if (e.a == 0) {
+          int slot = findFreeEntitySlot();
+          if (slot >= 0) {
+            Entity &s = g_ents[slot];
+            s = {};
+            s.on = true;
+            s.type = E_SPINY;
+            s.state = 0; // egg
+            s.dir = 0;
+            s.r = {e.r.x + 8.0f, e.r.y + 16.0f, 16.0f, 16.0f};
+            s.vx = 0.0f;
+            s.vy = -150.0f;
+          }
+          // Show the throw frame for a moment.
+          e.state = 1;
+          e.timer = 0.0f;
+        }
+      }
+
+      if (e.r.x > g_camX - 64 && e.r.x < g_camX + GAME_W + 64) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
+          if (playerStomp(pl)) {
+            e.on = false;
+            pl.vy = jumpHeld(g_playerHeld[pi]) ? -Physics::BOUNCE_HEIGHT * 1.5f
+                                               : -Physics::BOUNCE_HEIGHT;
+            pl.score += 200;
+            if (g_sfxStomp)
+              Mix_PlayChannel(-1, g_sfxStomp, 0);
+          } else if (!playerIsInvulnerable(pl)) {
+            if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
+        }
+      }
+    } else if (e.type == E_SPINY) {
+      // Spiny: egg falls, then walks. Can't be stomped.
+      constexpr float kGravity = 15.0f;
+      e.vy += kGravity;
+      e.r.y += e.vy * dt;
+      if (e.state == 0) {
+        // Egg: no horizontal motion.
+        int midTx = (int)((e.r.x + 8.0f) / TILE);
+        int bottomTy = (int)((e.r.y + e.r.h) / TILE);
+        uint8_t col = collisionAt(midTx, bottomTy);
+        if (col == COL_SOLID || col == COL_ONEWAY) {
+          e.r.y = bottomTy * TILE - e.r.h;
+          e.vy = 0.0f;
+          e.state = 1;
+          e.dir = (g_p.r.x + g_p.r.w * 0.5f >= e.r.x) ? 1 : -1;
+          e.vx = 32.0f;
+        }
+      } else {
+        if (e.dir == 0)
+          e.dir = -1;
+        if (e.vx == 0.0f)
+          e.vx = 32.0f;
+        e.r.x += e.dir * e.vx * dt;
+        int frontTx =
+            e.dir > 0 ? (int)((e.r.x + e.r.w) / TILE) : (int)(e.r.x / TILE);
+        int frontTy = (int)((e.r.y + e.r.h - 1) / TILE);
+        if (solidAt(frontTx, frontTy))
+          e.dir = -e.dir;
+      }
+
+      if (e.r.x < g_camX - 96 || e.r.x > g_camX + GAME_W + 96 ||
+          e.r.y > GAME_H + 64) {
+        e.on = false;
+        continue;
+      }
+
+      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
+          if (!playerIsInvulnerable(pl)) {
+            if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
+              pl.vy = -Physics::BOUNCE_HEIGHT * 0.75f;
+            }
+          }
+          break;
+        }
+      }
+    } else if (e.type == E_BLOOPER) {
+      // Blooper (Godot: Blooper.gd): drift down until near player, then rise.
+      if (g_theme != THEME_UNDERWATER && g_theme != THEME_CASTLE_WATER) {
+        // Only meaningful in underwater sections; keep it out of non-water themes.
+        e.on = false;
+        continue;
+      }
+
+      float playerY = g_p.r.y;
+      if (e.state == 0) {
+        e.r.y += 32.0f * dt;
+        if (e.r.y >= playerY - 24.0f && e.a == 0) {
+          // Begin rise.
+          int dir = (g_p.r.x + g_p.r.w * 0.5f >= e.r.x) ? 1 : -1;
+          e.dir = dir;
+          e.vx = 32.0f * (float)dir / 0.75f;
+          e.vy = -32.0f / 0.75f;
+          // Add a little side drift so bloopers don't feel too rigid (requested).
+          e.b = (rand() % 3) - 1; // -1,0,1
+          e.state = 1;
+          e.timer = 0.0f;
+          e.a = 1;
+        }
+      } else if (e.state == 1) {
+        // Occasionally tweak drift direction during the rise.
+        if ((rand() % 40) == 0)
+          e.b = (rand() % 3) - 1;
+        float drift = (float)e.b * 14.0f * dt;
+        e.r.x += e.vx * dt;
+        e.r.x += drift;
+        e.r.y += e.vy * dt;
+        if (e.r.y < 0.0f)
+          e.r.y = 0.0f;
+        if (e.r.y > 64.0f)
+          e.r.y = 64.0f;
+        if (e.timer >= 0.75f) {
+          e.state = 2;
+          e.timer = 0.0f;
+          e.vx = 0.0f;
+          e.vy = 0.0f;
+        }
+      } else {
+        if (e.timer >= 0.25f) {
+          e.state = 0;
+          e.timer = 0.0f;
+          e.a = 0;
+        }
+      }
+
+      if (e.r.x < g_camX - 96 || e.r.x > g_camX + GAME_W + 96 ||
+          e.r.y > GAME_H + 64) {
+        e.on = false;
+        continue;
+      }
+
+      if (e.r.x > g_camX - 32 && e.r.x < g_camX + GAME_W + 32) {
+        Rect er = enemyHitRect(e);
+        for (int pi = 0; pi < g_playerCount; pi++) {
+          Player &pl = g_players[pi];
+          if (pl.dead || !overlap(pl.r, er))
+            continue;
+          // Blooper can't be stomped (underwater hazard).
+          if (!playerIsInvulnerable(pl)) {
+            if (pl.power > P_SMALL) {
+              pl.power = P_SMALL;
+              pl.crouch = false;
+              setPlayerSizePreserveFeet(pl, PLAYER_HIT_W_SMALL, PLAYER_HIT_H_SMALL);
+              pl.invT = 2.0f;
+              if (g_sfxDamage)
+                Mix_PlayChannel(-1, g_sfxDamage, 0);
+            } else if (pi == 0) {
+              pl.dead = true;
+              pl.lives--;
+              g_state = GS_DEAD;
+              Mix_HaltMusic();
+            } else {
+              pl.invT = 2.0f;
             }
           }
           break;
@@ -3705,7 +4488,7 @@ void updateEntities(float dt) {
             pl.score += 200;
             if (g_sfxStomp)
               Mix_PlayChannel(-1, g_sfxStomp, 0);
-          } else if (pl.invT <= 0) {
+          } else if (!playerIsInvulnerable(pl)) {
             if (pl.power > P_SMALL) {
               pl.power = P_SMALL;
               pl.crouch = false;
@@ -3766,7 +4549,7 @@ void updateEntities(float dt) {
             pl.score += 200;
             if (g_sfxStomp)
               Mix_PlayChannel(-1, g_sfxStomp, 0);
-          } else if (pl.invT <= 0) {
+          } else if (!playerIsInvulnerable(pl)) {
             if (pl.power > P_SMALL) {
               pl.power = P_SMALL;
               pl.crouch = false;
@@ -3820,7 +4603,7 @@ void updateEntities(float dt) {
             pl.score += 200;
             if (g_sfxStomp)
               Mix_PlayChannel(-1, g_sfxStomp, 0);
-          } else if (pl.invT <= 0) {
+          } else if (!playerIsInvulnerable(pl)) {
             if (pl.power > P_SMALL) {
               pl.power = P_SMALL;
               pl.crouch = false;
@@ -3896,7 +4679,7 @@ void updateEntities(float dt) {
           Player &pl = g_players[pi];
           if (pl.dead || !overlap(pl.r, e.r))
             continue;
-          if (pl.invT <= 0) {
+          if (!playerIsInvulnerable(pl)) {
             if (pl.power > P_SMALL) {
               pl.power = P_SMALL;
               pl.crouch = false;
@@ -4038,20 +4821,27 @@ void updateEntities(float dt) {
         if (!t.on)
           continue;
         if (t.type != E_GOOMBA && t.type != E_KOOPA && t.type != E_KOOPA_RED &&
+            t.type != E_BUZZY_BEETLE && t.type != E_BLOOPER &&
+            t.type != E_LAKITU && t.type != E_SPINY && t.type != E_HAMMER_BRO &&
             t.type != E_CHEEP_LEAP && t.type != E_CHEEP_SWIM &&
             t.type != E_BULLET_BILL && t.type != E_BOWSER)
           continue;
         if (!overlap(e.r, enemyHitRect(t)))
           continue;
+        bool awardPoints = true;
         if (t.type == E_BOWSER) {
           t.state += 1;
           if (t.state >= 8)
             t.on = false;
+        } else if (t.type == E_BUZZY_BEETLE) {
+          // Classic behavior: Buzzy Beetles shrug off fireballs.
+          awardPoints = false;
         } else {
           t.on = false;
         }
         e.on = false;
-        g_p.score += 200;
+        if (awardPoints)
+          g_p.score += 200;
         break;
       }
     } else if (e.type == E_COIN_POPUP) {
@@ -4069,6 +4859,10 @@ void updateEntities(float dt) {
       return e.state == 0;
     if (e.type == E_KOOPA || e.type == E_KOOPA_RED)
       return true;
+    if (e.type == E_BUZZY_BEETLE)
+      return true;
+    if (e.type == E_SPINY || e.type == E_HAMMER_BRO)
+      return true;
     return false;
   };
 
@@ -4082,8 +4876,15 @@ void updateEntities(float dt) {
         continue;
       if (!overlap(enemyHitRect(a), enemyHitRect(b)))
         continue;
-      bool aShell = (a.type == E_KOOPA && a.state == 2);
-      bool bShell = (b.type == E_KOOPA && b.state == 2);
+      auto isShell = [](const Entity &e) {
+        if (e.type == E_KOOPA || e.type == E_KOOPA_RED)
+          return e.state == 2;
+        if (e.type == E_BUZZY_BEETLE)
+          return e.state == 2;
+        return false;
+      };
+      bool aShell = isShell(a);
+      bool bShell = isShell(b);
 
       if (aShell && !bShell) {
         b.on = false;
@@ -4534,7 +5335,33 @@ void render() {
       SDL_Color camCol = forcedBacktrack ? SDL_Color{160, 160, 160, 255}
                                          : (g_optionsIndex == 2 ? hi : norm);
       drawTextShadow(70, baseY + 32, line3, 1, camCol);
-      drawTextShadow(70, baseY + 56, "B BACK", 1, {220, 220, 220, 255});
+      drawTextShadow(70, baseY + 48, "CHEATS", 1,
+                     g_optionsIndex == 3 ? hi : norm);
+      drawTextShadow(70, baseY + 72, "B BACK", 1, {220, 220, 220, 255});
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+    } else if (g_titleMode == TITLE_CHEATS) {
+      SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+      SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 190);
+      SDL_Rect cPanel = {52, 58, GAME_W - 104, 146};
+      SDL_RenderFillRect(g_ren, &cPanel);
+      SDL_SetRenderDrawColor(g_ren, 255, 255, 255, 255);
+      SDL_RenderDrawRect(g_ren, &cPanel);
+
+      const char *title = "CHEATS";
+      drawTextShadow((GAME_W - textWidth(title, 2)) / 2, 66, title, 2,
+                     {255, 255, 255, 255});
+
+      const char *line1 =
+          g_cheatMoonJump ? "MOONJUMP: ON" : "MOONJUMP: OFF";
+      const char *line2 = g_cheatGodMode ? "GODMODE: ON" : "GODMODE: OFF";
+      int baseY = 98;
+      SDL_Color hi = {255, 255, 0, 255};
+      SDL_Color norm = {255, 255, 255, 255};
+      drawTextShadow(70, baseY, line1, 1, g_cheatsIndex == 0 ? hi : norm);
+      drawTextShadow(70, baseY + 16, line2, 1, g_cheatsIndex == 1 ? hi : norm);
+      drawTextShadow(70, baseY + 40, "NOTE: PITS STILL KILL", 1,
+                     {200, 200, 200, 255});
+      drawTextShadow(70, baseY + 72, "B BACK", 1, {220, 220, 220, 255});
       SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
     } else if (g_titleMode == TITLE_EXTRAS) {
       SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
@@ -4835,8 +5662,106 @@ void render() {
           SDL_SetRenderDrawColor(g_ren, 0, 160, 0, 255);
           SDL_RenderFillRect(g_ren, &dst);
         }
+      } else if (e.type == E_BUZZY_BEETLE) {
+        if (g_texBuzzy) {
+          // BuzzyBeetle.png contains both walk frames (x=0..31) and shell
+          // frames starting at x=32 (see BuzzyBeetleShell.json).
+          SDL_Rect src = {0, 0, 16, 16};
+          if (e.state == 0) {
+            int frame = ((int)(e.timer * 8) % 2);
+            src.x = frame * 16;
+          } else if (e.state == 1) {
+            // Shell idle: use the "Idle" frame (x=48) from the default strip.
+            src.x = 48;
+          } else {
+            // Shell spinning: cycle 4 frames (x=48..96).
+            static const int kSpinX[4] = {48, 64, 80, 96};
+            int frame = ((int)(e.timer * 14) % 4);
+            src.x = kSpinX[frame];
+          }
+          SDL_RendererFlip flip =
+              (e.dir > 0) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+          renderCopyExWithShadow(g_texBuzzy, &src, &dst, flip);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 60, 60, 60, 255);
+          SDL_RenderFillRect(g_ren, &dst);
+        }
+      } else if (e.type == E_BLOOPER) {
+        if (g_texBlooper) {
+          // Blooper.png: 2 frames in a 32x24 strip (Rise at x=0, Fall at x=16).
+          SDL_Rect src = {(e.state == 1) ? 0 : 16, 0, 16, 24};
+          SDL_Rect drawDst = dst;
+          drawDst.h = 24;
+          renderCopyWithShadow(g_texBlooper, &src, &drawDst);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 240, 240, 240, 255);
+          SDL_Rect drawDst = dst;
+          drawDst.h = 24;
+          SDL_RenderFillRect(g_ren, &drawDst);
+        }
+      } else if (e.type == E_LAKITU) {
+        // Lakitu rides a 32x32 cloud with a 16x24 body sprite.
+        if (g_texLakituCloud) {
+          SDL_Rect cloudSrc = {0, 0, 32, 32};
+          SDL_Rect cloudDst = {dst.x - 8, dst.y + 8, 32, 32};
+          renderCopyWithShadow(g_texLakituCloud, &cloudSrc, &cloudDst);
+        }
+        if (g_texLakitu) {
+          SDL_Rect src = {(e.state == 1) ? 16 : 0, 0, 16, 24};
+          SDL_Rect drawDst = dst;
+          drawDst.h = 24;
+          SDL_RendererFlip flip =
+              (e.dir > 0) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+          renderCopyExWithShadow(g_texLakitu, &src, &drawDst, flip);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 250, 250, 250, 255);
+          SDL_Rect drawDst = dst;
+          drawDst.h = 24;
+          SDL_RenderFillRect(g_ren, &drawDst);
+        }
+      } else if (e.type == E_SPINY) {
+        if (g_texSpiny) {
+          // Spiny.png: egg frames at y=0, walk frames at y=16.
+          int frame = ((int)(e.timer * ((e.state == 0) ? 14 : 8)) % 2);
+          SDL_Rect src = {frame * 16, (e.state == 0) ? 0 : 16, 16, 16};
+          SDL_RendererFlip flip =
+              (e.dir > 0) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+          renderCopyExWithShadow(g_texSpiny, &src, &dst, flip);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 220, 40, 40, 255);
+          SDL_RenderFillRect(g_ren, &dst);
+        }
+      } else if (e.type == E_HAMMER_BRO) {
+        if (g_texHammerBro) {
+          // HammerBro.png: Idle (x=0..31), Hammer (x=32..63).
+          bool throwing = (e.a > 0);
+          int baseX = throwing ? 32 : 0;
+          int frame = ((int)(e.timer * 10) % 2);
+          SDL_Rect src = {baseX + frame * 16, 0, 16, 24};
+          SDL_Rect drawDst = dst;
+          drawDst.h = 24;
+          SDL_RendererFlip flip =
+              (e.dir > 0) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+          renderCopyExWithShadow(g_texHammerBro, &src, &drawDst, flip);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 240, 240, 240, 255);
+          SDL_Rect drawDst = dst;
+          drawDst.h = 24;
+          SDL_RenderFillRect(g_ren, &drawDst);
+        }
+      } else if (e.type == E_HAMMER) {
+        if (g_texHammer) {
+          SDL_Rect src = {0, 0, 16, 16};
+          SDL_Point center = {8, 8};
+          double angle = fmod(e.timer * 720.0, 360.0);
+          renderCopyExWithShadowAngle(g_texHammer, &src, &dst, angle,
+                                      SDL_FLIP_NONE, &center);
+        } else {
+          SDL_SetRenderDrawColor(g_ren, 200, 200, 200, 255);
+          SDL_RenderFillRect(g_ren, &dst);
+        }
       } else if (e.type == E_PLATFORM_SIDEWAYS || e.type == E_PLATFORM_VERTICAL ||
-                 e.type == E_PLATFORM_ROPE) {
+                 e.type == E_PLATFORM_ROPE || e.type == E_PLATFORM_FALLING) {
         if (g_texPlatform) {
           SDL_Rect srcL = {0, 0, 8, 8};
           SDL_Rect srcM = {8, 0, 8, 8};

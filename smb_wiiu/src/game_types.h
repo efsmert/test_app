@@ -24,6 +24,12 @@ enum EType {
   E_GOOMBA,
   E_KOOPA,
   E_KOOPA_RED,
+  E_BUZZY_BEETLE,
+  E_BLOOPER,
+  E_SPINY,
+  E_LAKITU,
+  E_HAMMER_BRO,
+  E_HAMMER,
   E_MUSHROOM,
   E_FIRE_FLOWER,
   E_FIREBALL,
@@ -40,6 +46,7 @@ enum EType {
   E_PLATFORM_SIDEWAYS,
   E_PLATFORM_VERTICAL,
   E_PLATFORM_ROPE,
+  E_PLATFORM_FALLING,
 
   // Castle completion trigger (axe at the end of Bowser bridges).
   E_CASTLE_AXE,

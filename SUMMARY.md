@@ -255,3 +255,69 @@ Goal: make later worlds/stages beatable by bringing over key gameplay objects fr
 - Reduced camera-parallax multipliers so both layers feel less “slippery” while still moving slightly faster than the world:
   - cloud overlay `kCloudPanMul` reduced
   - ambient particles `kParticlePanMul` reduced
+
+### 2026-01-30 — Missing Enemy Visibility + Cheats Menu (Moonjump / Godmode)
+
+#### 1) “Missing” enemies were actually invisible (render paths missing)
+- Symptom: Bloopers / Lakitu / Spinies / Buzzy Beetles / Hammer Bros existed in logic and level export, but appeared “missing” in-game because the render loop only handled Goomba/Koopa/Cheep/BulletBill/etc.
+- Fix: Added entity rendering branches in `smb_wiiu/src/main.cpp` for:
+  - `E_BUZZY_BEETLE` (walk + shell idle + shell spin)
+  - `E_BLOOPER` (rise/fall frame)
+  - `E_LAKITU` (draws `LakituCloud.png` behind `Lakitu.png`)
+  - `E_SPINY` (egg vs walk)
+  - `E_HAMMER_BRO` (idle vs throw)
+  - `E_HAMMER` (rotates in-place using the existing shadow-rotation helper)
+
+#### 2) Lakitu “throw” animation
+- `E_LAKITU` now briefly switches to a throw frame when it spawns a spiny:
+  - Uses `Entity::state` as a visual-only toggle: `0=idle`, `1=throw`
+  - Automatically returns to idle after ~0.25s
+
+#### 3) Fireball + shell interactions extended for new enemy types
+- Fireballs can now hit more enemies:
+  - Added `E_BLOOPER`, `E_LAKITU`, `E_SPINY`, `E_HAMMER_BRO` to the fireball hit list.
+  - `E_BUZZY_BEETLE` is treated as **fireball-immune** (fireball disappears, no points).
+- Enemy-vs-enemy shell-kill logic updated:
+  - Shell detection now includes `E_KOOPA_RED` and `E_BUZZY_BEETLE` in moving-shell state (`state==2`).
+  - Targets for shell kills include `E_BUZZY_BEETLE`, `E_SPINY`, `E_HAMMER_BRO` as well as the original enemies.
+
+#### 4) Cheats menu (requested for testing)
+- Added a Cheats submenu reachable from Title → Settings:
+  - `MOONJUMP` (allows mid-air jumps using the normal jump buttons)
+  - `GODMODE` (immune to all enemy/projectile damage; **pits still kill**)
+- Implementation details:
+  - New helper `playerIsInvulnerable()` centralizes the check so Godmode applies consistently.
+  - Damage checks across enemy/projectile handlers now gate on `!playerIsInvulnerable(pl)`.
+
+#### 5) Build / packaging
+- Followed the updated `AGENTS.md` “safe” build flow (no `extract_rom.py` by default):
+  - Ran `python3 smb_wiiu/tools/godot_levels_to_cpp.py`
+  - Built `smb_wiiu/smb_wiiu.wuhb` via `make -C smb_wiiu wuhb`
+
+### 2026-01-30 — Cheep-Cheep Leap Generator Visibility (Jumping Fish “Stop Spawning” Feel)
+
+- Symptom: in jumping-fish stages (Cheep-Cheep leap generator), fish appeared to “stop spawning” later in the level.
+- Root cause: the leap generator spawned fish **left of screen center**, so as the player kept moving right the fish were frequently spawning behind/under the player and quickly leaving view, making it feel like spawning had stopped.
+- Fix: in `smb_wiiu/src/main.cpp` generator spawns for `E_CHEEP_LEAP` now spawn near the **right edge of the camera view**, so fish consistently appear ahead of the player across the whole stage.
+
+### 2026-01-30 — Cheep Leap Spawn Distribution + Green Chroma Key Fix + Enemy Movement Tweaks
+
+#### 1) Cheep-Cheep leap spawns should appear both ahead and behind
+- Feedback: after the “spawn near right edge” change, leaping fish only appeared in front of the player.
+- Fix: `E_CHEEP_LEAP` generator now spawns within/around the current camera view (`x = camX + rand(-32..GAME_W+31)`) so fish can jump both in front of and behind the player while still staying on-screen.
+- File: `smb_wiiu/src/main.cpp` (entity generator section).
+
+#### 2) Some Godot enemy/FX sheets rendered as solid green (missing chroma key)
+- Symptom: Cheep-Cheeps / Bloopers / Hammer Bros / hammers appeared “chroma-key green” (solid green rectangles).
+- Root cause: `loadTex()` only applied the bright-green colorkey to a small whitelist of sprite sheets (and to images without alpha). Many Godot-exported PNGs include an **unused alpha channel** but still use `#00FF00` backgrounds, so they weren’t being keyed.
+- Fix: `loadTex()` and `loadTexScaled()` now detect bright-green chroma sheets by checking the **top-left pixel** for `#00FF00` and applying the colorkey automatically.
+- Files: `smb_wiiu/src/main.cpp` (`loadTex`, `loadTexScaled`).
+
+#### 3) Hammer Bro and Blooper movement felt too rigid
+- Requested behavior:
+  - Hammer Bro should sometimes jump up to the platform above and occasionally end up on a platform below (via falling).
+  - Add a little horizontal randomness to Hammer Bro and Blooper motion.
+- Fixes:
+  - Hammer Bro: added slow patrol drift, wall bounce, edge reversal (with a small chance to **not** reverse so it can fall), plus a “prefer higher jump if a platform exists above” rule.
+  - Blooper: added slight random sideways drift during the rise phase (never adds random downward motion).
+- File: `smb_wiiu/src/main.cpp` (enemy update section for `E_HAMMER_BRO` and `E_BLOOPER`).
